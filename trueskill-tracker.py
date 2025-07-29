@@ -847,8 +847,8 @@ async def leaderboard(ctx, limit: int = 20):
             conservative_skill = player['mu'] - 3 * player['sigma']
             winrate = (player['wins'] / player['games_played'] * 100) if player['games_played'] > 0 else 0
             
-            medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
-            leaderboard_text += f"{medal} **{player['username']}** - {conservative_skill:.1f} ({player['games_played']} games, {winrate:.1f}% WR)\n"
+            medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else "🧙" if player['username'] == "paizen" else f"{i}."
+            leaderboard_text += f"{medal} **{player['username']}** >> {conservative_skill:.1f} ({player['games_played']} games, {winrate:.1f}% WR)\n"
         
         embed.description = leaderboard_text
         await ctx.send(embed=embed)
@@ -997,7 +997,7 @@ async def create_teams(ctx, region: str = None):
             max_avg = max(team_averages)
             variance = TeamBalancer.calculate_variance(teams)
             balance_quality = "Excellent" if variance < 0.5 else "Good" if variance < 2.0 else "Fair"
-            
+            embed.add_field(name=" ", inline=True)
             embed.add_field(
                 name="🎯 Balance Quality",
                 value=f"{balance_quality}\n"
