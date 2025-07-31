@@ -283,8 +283,12 @@ class TeamBalancer:
         return variance
     
     @staticmethod
-    def generate_optimal_teams(players: List[Dict], num_teams: int, max_iterations: int = 10000) -> List[List[Dict]]:
-        """Generate teams with minimal variance using optimization algorithm."""
+    def generate_optimal_teams(players: List[Dict], num_teams: int, max_iterations: int = 10000, use_randomization: bool = False) -> List[List[Dict]]:
+        """Generate teams with minimal variance using optimization algorithm.
+        
+        Args:
+            use_randomization: If True, applies more aggressive randomization
+        """
         if len(players) < 2 or num_teams < 1:
             return []
         
@@ -303,13 +307,21 @@ class TeamBalancer:
             
             # Distribute players in a snake draft pattern with randomization
             player_list = players_sorted.copy()
-            if attempt > 0:  # Add randomization after first attempt
-                # Shuffle within skill tiers to add variety
-                tier_size = max(1, len(player_list) // 4)
-                for i in range(0, len(player_list), tier_size):
-                    tier = player_list[i:i + tier_size]
-                    random.shuffle(tier)
-                    player_list[i:i + tier_size] = tier
+            if attempt > 0 or use_randomization:  # Add randomization after first attempt or if requested
+                if use_randomization:
+                    # More aggressive randomization - shuffle entire skill tiers
+                    tier_size = max(2, len(player_list) // 3)  # Larger tiers for more randomness
+                    for i in range(0, len(player_list), tier_size):
+                        tier = player_list[i:i + tier_size]
+                        random.shuffle(tier)
+                        player_list[i:i + tier_size] = tier
+                else:
+                    # Standard randomization - shuffle within smaller skill tiers
+                    tier_size = max(1, len(player_list) // 4)
+                    for i in range(0, len(player_list), tier_size):
+                        tier = player_list[i:i + tier_size]
+                        random.shuffle(tier)
+                        player_list[i:i + tier_size] = tier
             
             # Initial distribution using snake draft
             for i, player in enumerate(player_list):
@@ -365,12 +377,13 @@ class TeamBalancer:
         return []
     
     @staticmethod
-    def balance_teams(players: List[Dict], num_teams: int = 2) -> List[List[Dict]]:
+    def balance_teams(players: List[Dict], num_teams: int = 2, use_randomization: bool = False) -> List[List[Dict]]:
         """Balance players into teams using optimized algorithm for minimal variance.
         
         Args:
             players: List of player dictionaries
             num_teams: Desired number of teams (will be capped at 5)
+            use_randomization: If True, adds more randomization to team generation
         
         Returns:
             List of teams with minimized average skill variance
@@ -378,43 +391,51 @@ class TeamBalancer:
         if len(players) < 2:
             return []
         
-        # Cap number of teams at 5
-        max_teams = min(5, num_teams)
-        
-        # Calculate optimal number of teams based on player count
         total_players = len(players)
         
+        # Calculate optimal number of teams based on player count
+        # Aim for 2-4 players per team, prefer more balanced distribution
         if total_players <= 4:
-            optimal_teams = 2 if total_players >= 2 else 1
+            optimal_teams = 2 if total_players >= 4 else 1
+        elif total_players <= 6:
+            optimal_teams = 3  # 2 players per team
         elif total_players <= 8:
-            optimal_teams = 2
+            optimal_teams = 2  # 4 players per team
         elif total_players <= 12:
-            optimal_teams = 3
+            optimal_teams = 3  # 3-4 players per team
         elif total_players <= 16:
-            optimal_teams = 4
+            optimal_teams = 4  # 4 players per team
         else:
-            optimal_teams = 5
+            optimal_teams = 5  # Up to 4+ players per team
         
-        # Use the smaller of requested teams or optimal teams
-        final_teams = min(max_teams, optimal_teams)
+        # Cap number of teams at 5
+        final_teams = min(5, optimal_teams)
         
         # Ensure we can make at least 2 players per team (when possible)
         while final_teams > 1 and (total_players // final_teams) < 2:
             final_teams -= 1
         
+        # Ensure we don't exceed 4 players per team if we can avoid it
+        while final_teams < 5 and (total_players / final_teams) > 4:
+            final_teams += 1
+        
         if final_teams < 1:
             return []
         
-        # Use the optimization algorithm
-        return TeamBalancer.generate_optimal_teams(players, final_teams)
+        # Use pure random or optimization algorithm based on randomization setting
+        if use_randomization:
+            return TeamBalancer.generate_random_teams(players, final_teams)
+        else:
+            return TeamBalancer.generate_optimal_teams(players, final_teams)
     
     @staticmethod
-    def balance_teams_with_region(players: List[Dict], required_region: str) -> List[List[Dict]]:
+    def balance_teams_with_region(players: List[Dict], required_region: str, use_randomization: bool = False) -> List[List[Dict]]:
         """Balance players into teams ensuring each team has at least one player from the required region.
         
         Args:
             players: List of player dictionaries
             required_region: Region that must be represented in every team
+            use_randomization: If True, adds more randomization to team generation
         
         Returns:
             List of teams, each containing at least one player from required_region
@@ -456,18 +477,81 @@ class TeamBalancer:
         if final_teams < 1:
             return []
         
-        # Use optimized algorithm with region constraint
-        return TeamBalancer.generate_optimal_teams_with_region(
-            region_players, other_players, final_teams
-        )
+        # Use pure random or optimized algorithm with region constraint
+        if use_randomization:
+            return TeamBalancer.generate_random_teams_with_region(
+                region_players, other_players, final_teams
+            )
+        else:
+            return TeamBalancer.generate_optimal_teams_with_region(
+                region_players, other_players, final_teams
+            )
+    
+    @staticmethod
+    def generate_random_teams(players: List[Dict], num_teams: int) -> List[List[Dict]]:
+        """Generate completely random teams ignoring skill levels."""
+        if len(players) < 2 or num_teams < 1:
+            return []
+        
+        # Shuffle all players completely randomly
+        shuffled_players = players.copy()
+        random.shuffle(shuffled_players)
+        
+        # Distribute players randomly across teams
+        teams = [[] for _ in range(num_teams)]
+        
+        for i, player in enumerate(shuffled_players):
+            team_idx = i % num_teams
+            if len(teams[team_idx]) < 4:  # Max 4 players per team
+                teams[team_idx].append(player)
+        
+        # Remove empty teams
+        return [team for team in teams if team]
+    
+    @staticmethod
+    def generate_random_teams_with_region(
+        region_players: List[Dict], 
+        other_players: List[Dict], 
+        num_teams: int
+    ) -> List[List[Dict]]:
+        """Generate completely random teams with region constraint."""
+        if num_teams < 1 or not region_players:
+            return []
+        
+        teams = [[] for _ in range(num_teams)]
+        
+        # Randomly assign one region player to each team
+        shuffled_region = region_players.copy()
+        random.shuffle(shuffled_region)
+        
+        for i in range(min(num_teams, len(shuffled_region))):
+            teams[i].append(shuffled_region[i])
+        
+        # Randomly distribute remaining players
+        remaining_region = shuffled_region[num_teams:]
+        all_remaining = remaining_region + other_players
+        random.shuffle(all_remaining)
+        
+        for i, player in enumerate(all_remaining):
+            team_idx = i % num_teams
+            if len(teams[team_idx]) < 4:  # Max 4 players per team
+                teams[team_idx].append(player)
+        
+        # Remove empty teams
+        return [team for team in teams if team]
     
     @staticmethod
     def generate_optimal_teams_with_region(
         region_players: List[Dict], 
         other_players: List[Dict], 
-        num_teams: int
+        num_teams: int,
+        use_randomization: bool = False
     ) -> List[List[Dict]]:
-        """Generate region-constrained teams with minimal variance."""
+        """Generate region-constrained teams with minimal variance.
+        
+        Args:
+            use_randomization: If True, applies more aggressive randomization
+        """
         if num_teams < 1 or not region_players:
             return []
         
@@ -486,9 +570,14 @@ class TeamBalancer:
             
             # First, assign one region player to each team (required constraint)
             region_list = region_sorted.copy()
-            if attempt > 0:
-                # Add some randomization for variety
-                tier_size = max(1, len(region_list) // 3)
+            if attempt > 0 or use_randomization:
+                if use_randomization:
+                    # More aggressive randomization for region players
+                    tier_size = max(2, len(region_list) // 2)
+                else:
+                    # Standard randomization
+                    tier_size = max(1, len(region_list) // 3)
+                    
                 for i in range(0, len(region_list), tier_size):
                     tier = region_list[i:i + tier_size]
                     random.shuffle(tier)
@@ -502,9 +591,14 @@ class TeamBalancer:
             remaining_region = region_list[num_teams:]
             all_remaining = remaining_region + other_sorted
             
-            if attempt > 0 and all_remaining:
-                # Shuffle within skill tiers for variety
-                tier_size = max(1, len(all_remaining) // 4)
+            if attempt > 0 and all_remaining or use_randomization:
+                if use_randomization:
+                    # More aggressive randomization - larger tiers
+                    tier_size = max(2, len(all_remaining) // 3)
+                else:
+                    # Standard randomization
+                    tier_size = max(1, len(all_remaining) // 4)
+                    
                 for i in range(0, len(all_remaining), tier_size):
                     tier = all_remaining[i:i + tier_size]
                     random.shuffle(tier)
@@ -709,7 +803,9 @@ async def trueskill_command(ctx):
     embed.add_field(
         name="Team Management",
         value="`!ts teams` - Create balanced teams from Waiting Room\n"
+              "`!ts teams random` - Create completely random teams\n"
               "`!ts teams <region>` - Create teams with at least one player from region\n"
+              "`!ts teams <region> random` - Create random region-based teams\n"
               "`!ts cleanup` - Move all players back to Waiting Room and delete temp channels",
         inline=False
     )
@@ -721,8 +817,8 @@ async def trueskill_command(ctx):
               "`!ts teamwin <team_number>` - Award team members a win\n"
               "`!ts teamloss <team_number>` - Award team members a loss\n"
               "`!ts teamdraw <team_number>` - Award team members a draw\n"
-              "`!ts draw <team1_players...> vs <team2_players...>` - Record draw\n"
-              "`!ts 1v1 <@winner> <@loser>` - Record 1v1 match",
+              "`!ts draw <team1_players...> vs <team2_players...>` - Record draw\n",
+              #"`!ts 1v1 <@winner> <@loser>` - Record 1v1 match"
         inline=False
     )
     
@@ -857,13 +953,29 @@ async def leaderboard(ctx, limit: int = 20):
         await ctx.send(f"❌ Error generating leaderboard: {str(e)}")
 
 @trueskill_command.command(name='teams')
-async def create_teams(ctx, region: str = None):
+async def create_teams(ctx, *, args: str = None):
     """Create balanced teams from players in the Waiting Room.
     
     Args:
-        region: Optional region - if provided, ensures each team has at least one player from this region
+        args: Can be 'random', '<region>', '<region> random', or empty
     """
     try:
+        # Parse arguments
+        region = None
+        use_randomization = False
+        
+        if args:
+            args_list = args.strip().split()
+            
+            # Check if 'random' is in the arguments
+            if 'random' in args_list:
+                use_randomization = True
+                # Remove 'random' and treat remaining as region
+                args_list = [arg for arg in args_list if arg.lower() != 'random']
+                
+            # If there's still an argument left, it's the region
+            if args_list:
+                region = args_list[0]
         # Find the "Waiting Room" voice channel
         waiting_room = None
         for channel in ctx.guild.voice_channels:
@@ -914,7 +1026,7 @@ async def create_teams(ctx, region: str = None):
         
         # Balance teams based on whether region is specified
         if region:
-            teams = TeamBalancer.balance_teams_with_region(players, region)
+            teams = TeamBalancer.balance_teams_with_region(players, region, use_randomization)
             
             # Check if region-based balancing failed
             if not teams:
@@ -942,7 +1054,7 @@ async def create_teams(ctx, region: str = None):
                 return
         else:
             # Standard team balancing
-            teams = TeamBalancer.balance_teams(players)
+            teams = TeamBalancer.balance_teams(players, use_randomization=use_randomization)
         
         if not teams:
             embed = discord.Embed(
@@ -954,7 +1066,25 @@ async def create_teams(ctx, region: str = None):
             return
         
         # Create embed showing team composition
-        if region:
+        if use_randomization:
+            if region:
+                embed = discord.Embed(
+                    title="🎲 Random Region-Based Teams",
+                    description=f"Created {len(teams)} completely random teams from {len(players)} players:\n"
+                               f"🌍 Each team has at least one '{region}' player\n"
+                               f"🎯 Teams are randomized (ignoring TrueSkill ratings)\n"
+                               f"📊 Max 4 players per team | Max 5 teams total",
+                    color=discord.Color.purple()
+                )
+            else:
+                embed = discord.Embed(
+                    title="🎲 Completely Random Teams",
+                    description=f"Created {len(teams)} completely random teams from {len(players)} players:\n"
+                               f"🎯 Teams are randomized (ignoring TrueSkill ratings)\n"
+                               f"📊 Max 4 players per team | Max 5 teams total",
+                    color=discord.Color.purple()
+                )
+        elif region:
             embed = discord.Embed(
                 title="⚖️ Region-Based Balanced Teams",
                 description=f"Created {len(teams)} balanced teams from {len(players)} players:\n"
@@ -971,40 +1101,60 @@ async def create_teams(ctx, region: str = None):
             )
         
         for i, team in enumerate(teams, 1):
-            team_strength = sum(TeamBalancer.get_player_skill(p) for p in team) / len(team)
-            team_text = ""
-            
-            for player in team:
-                conservative_skill = TeamBalancer.get_player_skill(player)
-                if region:
-                    # Show region info when using region-based balancing
-                    player_region = player.get('region', 'Unknown')
-                    region_indicator = " 🌍" if player_region.lower() == region.lower() else ""
-                    team_text += f"• {player['username']} ({conservative_skill:.1f}) [{player_region}]{region_indicator}\n"
-                else:
-                    team_text += f"• {player['username']} ({conservative_skill:.1f})\n"
-            
-            embed.add_field(
-                name=f"Team {i} (Avg: {team_strength:.1f})",
-                value=team_text,
-                inline=True
-            )
+            if use_randomization:
+                # For random teams, just show players without skill ratings
+                team_text = ""
+                for player in team:
+                    if region:
+                        # Show region info when using region-based balancing
+                        player_region = player.get('region', 'Unknown')
+                        region_indicator = " 🌍" if player_region.lower() == region.lower() else ""
+                        team_text += f"• {player['username']} [{player_region}]{region_indicator}\n"
+                    else:
+                        team_text += f"• {player['username']}\n"
+                
+                embed.add_field(
+                    name=f"Team {i} ({len(team)} players)",
+                    value=team_text,
+                    inline=True
+                )
+            else:
+                # For balanced teams, show skill ratings
+                team_strength = sum(TeamBalancer.get_player_skill(p) for p in team) / len(team)
+                team_text = ""
+                
+                for player in team:
+                    conservative_skill = TeamBalancer.get_player_skill(player)
+                    if region:
+                        # Show region info when using region-based balancing
+                        player_region = player.get('region', 'Unknown')
+                        region_indicator = " 🌍" if player_region.lower() == region.lower() else ""
+                        team_text += f"• {player['username']} ({conservative_skill:.1f}) [{player_region}]{region_indicator}\n"
+                    else:
+                        team_text += f"• {player['username']} ({conservative_skill:.1f})\n"
+                
+                embed.add_field(
+                    name=f"Team {i} (Avg: {team_strength:.1f})",
+                    value=team_text,
+                    inline=True
+                )
         
-        # Add balance statistics
-        team_averages = [TeamBalancer.calculate_team_average(team) for team in teams]
-        if len(team_averages) > 1:
-            min_avg = min(team_averages)
-            max_avg = max(team_averages)
-            variance = TeamBalancer.calculate_variance(teams)
-            balance_quality = "Excellent" if variance < 0.5 else "Good" if variance < 2.0 else "Fair"
-            embed.add_field(name=" ", inline=True)
-            embed.add_field(
-                name="🎯 Balance Quality",
-                value=f"{balance_quality}\n"
-                     f"Range: {min_avg:.1f} - {max_avg:.1f}\n"
-                     f"Difference: {max_avg - min_avg:.1f}",
-                inline=True
-            )
+        # Add balance statistics (only for balanced teams, not random)
+        if not use_randomization:
+            team_averages = [TeamBalancer.calculate_team_average(team) for team in teams]
+            if len(team_averages) > 1:
+                min_avg = min(team_averages)
+                max_avg = max(team_averages)
+                variance = TeamBalancer.calculate_variance(teams)
+                balance_quality = "Excellent" if variance < 0.5 else "Good" if variance < 2.0 else "Fair"
+                
+                embed.add_field(
+                    name="🎯 Balance Quality",
+                    value=f"{balance_quality}\n"
+                         f"Range: {min_avg:.1f} - {max_avg:.1f}\n"
+                         f"Difference: {max_avg - min_avg:.1f}",
+                    inline=True
+                )
         
         # Store teams for win/loss tracking
         bot.current_teams[ctx.guild.id] = teams
@@ -1105,7 +1255,7 @@ async def record_win(ctx, member: discord.Member):
         # Create a basic rating increase for a win
         old_rating = trueskill.Rating(mu=player['mu'], sigma=player['sigma'])
         # Simulate a win against an average opponent
-        new_rating = trueskill.rate_1vs1(old_rating, trueskill.Rating())[0]
+        new_rating = trueskill.rate([[old_rating], [trueskill.Rating()]])[0][0]
         
         # Update player stats
         bot.db.update_player_stats(member.id, new_rating, 'win')
@@ -1137,7 +1287,7 @@ async def record_loss(ctx, member: discord.Member):
         # Create a basic rating decrease for a loss
         old_rating = trueskill.Rating(mu=player['mu'], sigma=player['sigma'])
         # Simulate a loss against an average opponent
-        new_rating = trueskill.rate_1vs1(old_rating, trueskill.Rating())[1]
+        new_rating = trueskill.rate([[old_rating], [trueskill.Rating()]])[1][0]
         
         # Update player stats
         bot.db.update_player_stats(member.id, new_rating, 'loss')
@@ -1223,7 +1373,7 @@ async def record_team_win(ctx, team_number: int):
         for player_data in winning_team:
             old_rating = trueskill.Rating(mu=player_data['mu'], sigma=player_data['sigma'])
             # Simulate a win against an average opponent
-            new_rating = trueskill.rate_1vs1(old_rating, trueskill.Rating())[0]
+            new_rating = trueskill.rate([[old_rating], [trueskill.Rating()]])[0][0]
             
             # Update player stats
             bot.db.update_player_stats(player_data['user_id'], new_rating, 'win')
@@ -1284,7 +1434,7 @@ async def record_team_loss(ctx, team_number: int):
         for player_data in losing_team:
             old_rating = trueskill.Rating(mu=player_data['mu'], sigma=player_data['sigma'])
             # Simulate a loss against an average opponent
-            new_rating = trueskill.rate_1vs1(old_rating, trueskill.Rating())[1]
+            new_rating = trueskill.rate([[old_rating], [trueskill.Rating()]])[1][0]
             
             # Update player stats
             bot.db.update_player_stats(player_data['user_id'], new_rating, 'loss')
