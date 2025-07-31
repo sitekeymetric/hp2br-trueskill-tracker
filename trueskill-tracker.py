@@ -1,264 +1,82 @@
 import discord
 from discord.ext import commands
-import sqlite3
 import os
 import asyncio
 import trueskill
-from typing import List, Optional, Dict, Tuple
+from typing import List, Optional, Dict, Tuple, Any
 import random
 import uuid
-from datetime import datetime
-import re
+import aiohttp
 from itertools import combinations
 import math
 
 # Initialize TrueSkill environment
 trueskill.setup(mu=25, sigma=8.333, beta=4.166, tau=0.083, draw_probability=0.10)
 
-class TrueSkillDatabase:
-    def __init__(self, db_path: str = "trueskill.db"):
-        self.db_path = db_path
-        self.init_database()
+# API Configuration
+TRUESKILL_API_URL = os.environ.get('TRUESKILL_API_URL', 'http://127.0.0.1:8081')
+
+class TrueSkillAPIClient:
+    """A client to interact with the TrueSkill Database Microservice."""
+    def __init__(self, base_url: str):
+        self.base_url = base_url
+
+    async def _request(self, method: str, endpoint: str, **kwargs) -> Any:
+        """Helper method for making API requests."""
+        async with aiohttp.ClientSession() as session:
+            try:
+                url = f"{self.base_url}{endpoint}"
+                async with session.request(method, url, **kwargs) as response:
+                    response.raise_for_status()
+                    return await response.json()
+            except aiohttp.ClientError as e:
+                print(f"API Error for {method} {endpoint}: {e}")
+                raise commands.CommandError(f"Error communicating with the TrueSkill microservice: {e}")
     
-    def init_database(self):
-        """Initialize the database with required tables."""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS players (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT NOT NULL,
-                region TEXT DEFAULT 'Unknown',
-                mu REAL DEFAULT 25.0,
-                sigma REAL DEFAULT 8.333,
-                games_played INTEGER DEFAULT 0,
-                wins INTEGER DEFAULT 0,
-                losses INTEGER DEFAULT 0,
-                draws INTEGER DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS games (
-                game_id TEXT PRIMARY KEY,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                completed_at TIMESTAMP,
-                status TEXT DEFAULT 'pending'
-            )
-        ''')
-        
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS game_players (
-                game_id TEXT,
-                user_id INTEGER,
-                team INTEGER,
-                old_mu REAL,
-                old_sigma REAL,
-                new_mu REAL,
-                new_sigma REAL,
-                FOREIGN KEY (game_id) REFERENCES games (game_id),
-                FOREIGN KEY (user_id) REFERENCES players (user_id)
-            )
-        ''')
-        
-        conn.commit()
-        
-        # Add draws column if it doesn't exist (for existing databases)
-        cursor.execute("PRAGMA table_info(players)")
-        columns = [column[1] for column in cursor.fetchall()]
-        if 'draws' not in columns:
-            cursor.execute('ALTER TABLE players ADD COLUMN draws INTEGER DEFAULT 0')
-            conn.commit()
-        
-        conn.close()
+    async def get_player(self, user_id: int) -> Optional[Dict]:
+        """Fetches a single player's data by user ID."""
+        try:
+            return await self._request('GET', f"/players/{user_id}")
+        except commands.CommandError:
+            return None
+
+    async def get_all_players(self) -> List[Dict]:
+        """Fetches all players from the database."""
+        return await self._request('GET', "/players")
     
-    def get_player(self, user_id: int) -> Optional[Dict]:
-        """Get player data by user ID."""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            SELECT user_id, username, region, mu, sigma, games_played, wins, losses, draws
-            FROM players WHERE user_id = ?
-        ''', (user_id,))
-        
-        row = cursor.fetchone()
-        conn.close()
-        
-        if row:
-            return {
-                'user_id': row[0],
-                'username': row[1],
-                'region': row[2],
-                'mu': row[3],
-                'sigma': row[4],
-                'games_played': row[5],
-                'wins': row[6],
-                'losses': row[7],
-                'draws': row[8]
-            }
-        return None
+    async def insert_or_update_player(self, user_id: int, username: str, region: Optional[str] = "Unknown"):
+        """Inserts a new player or updates an existing one."""
+        payload = {
+            "user_id": user_id,
+            "username": username,
+            "region": region
+        }
+        await self._request('POST', "/players", json=payload)
+
+    async def update_player_stats(self, user_id: int, mu: float, sigma: float, result: str):
+        """Updates a player's rating and game statistics."""
+        payload = {
+            "mu": mu,
+            "sigma": sigma,
+            "result": result
+        }
+        await self._request('PUT', f"/players/{user_id}/stats", json=payload)
     
-    def insert_or_update_player(self, user_id: int, username: str, region: str = None, 
-                               mu: float = 25.0, sigma: float = 8.333):
-        """Insert new player or update existing player."""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        existing_player = self.get_player(user_id)
-        
-        if existing_player:
-            # Update existing player
-            cursor.execute('''
-                UPDATE players SET username = ?, region = COALESCE(?, region),
-                mu = ?, sigma = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE user_id = ?
-            ''', (username, region, mu, sigma, user_id))
-        else:
-            # Insert new player
-            cursor.execute('''
-                INSERT INTO players (user_id, username, region, mu, sigma)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (user_id, username, region or 'Unknown', mu, sigma))
-        
-        conn.commit()
-        conn.close()
-    
-    def update_player_stats(self, user_id: int, new_rating: trueskill.Rating, 
-                           result: str = 'win'):
-        """Update player's rating and statistics.
-        Args:
-            result: 'win', 'loss', or 'draw'
-        """
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        if result == 'win':
-            cursor.execute('''
-                UPDATE players SET mu = ?, sigma = ?, games_played = games_played + 1,
-                wins = wins + 1, updated_at = CURRENT_TIMESTAMP
-                WHERE user_id = ?
-            ''', (new_rating.mu, new_rating.sigma, user_id))
-        elif result == 'loss':
-            cursor.execute('''
-                UPDATE players SET mu = ?, sigma = ?, games_played = games_played + 1,
-                losses = losses + 1, updated_at = CURRENT_TIMESTAMP
-                WHERE user_id = ?
-            ''', (new_rating.mu, new_rating.sigma, user_id))
-        elif result == 'draw':
-            cursor.execute('''
-                UPDATE players SET mu = ?, sigma = ?, games_played = games_played + 1,
-                draws = draws + 1, updated_at = CURRENT_TIMESTAMP
-                WHERE user_id = ?
-            ''', (new_rating.mu, new_rating.sigma, user_id))
-        
-        conn.commit()
-        conn.close()
-    
-    def record_game_result(self, teams: List[List[int]], winning_team_index: int) -> str:
-        """Record a game result and update all player ratings."""
-        game_id = str(uuid.uuid4())
-        
-        # Prepare rating groups for TrueSkill calculation
-        rating_groups = []
-        team_players = []
-        
-        for team in teams:
-            team_ratings = []
-            team_player_data = []
-            for user_id in team:
-                player = self.get_player(user_id)
-                if player:
-                    rating = trueskill.Rating(mu=player['mu'], sigma=player['sigma'])
-                    team_ratings.append(rating)
-                    team_player_data.append(player)
-                else:
-                    # Auto-create player if not exists
-                    self.insert_or_update_player(user_id, f"Player_{user_id}")
-                    player = self.get_player(user_id)
-                    rating = trueskill.Rating(mu=player['mu'], sigma=player['sigma'])
-                    team_ratings.append(rating)
-                    team_player_data.append(player)
-            
-            rating_groups.append(team_ratings)
-            team_players.append(team_player_data)
-        
-        # Calculate new ratings
-        if winning_team_index == -1:  # Draw
-            new_rating_groups = trueskill.rate(rating_groups)
-        else:
-            # Create ranks (0 for winner, 1 for losers)
-            ranks = [1] * len(teams)
-            ranks[winning_team_index] = 0
-            new_rating_groups = trueskill.rate(rating_groups, ranks=ranks)
-        
-        # Update database
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        # Record game
-        cursor.execute('''
-            INSERT INTO games (game_id, completed_at, status)
-            VALUES (?, CURRENT_TIMESTAMP, 'completed')
-        ''', (game_id,))
-        
-        # Update player ratings and record game participation
-        for team_idx, (team, new_team_ratings) in enumerate(zip(team_players, new_rating_groups)):
-            won = team_idx == winning_team_index
-            draw = winning_team_index == -1
-            
-            for player, old_rating, new_rating in zip(team, rating_groups[team_idx], new_team_ratings):
-                # Record game participation
-                cursor.execute('''
-                    INSERT INTO game_players 
-                    (game_id, user_id, team, old_mu, old_sigma, new_mu, new_sigma)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                ''', (game_id, player['user_id'], team_idx, 
-                      old_rating.mu, old_rating.sigma, new_rating.mu, new_rating.sigma))
-                
-                # Update player stats
-                if draw:
-                    cursor.execute('''
-                        UPDATE players SET mu = ?, sigma = ?, games_played = games_played + 1,
-                        draws = draws + 1, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?
-                    ''', (new_rating.mu, new_rating.sigma, player['user_id']))
-                else:
-                    result = 'win' if won else 'loss'
-                    self.update_player_stats(player['user_id'], new_rating, result)
-        
-        conn.commit()
-        conn.close()
-        return game_id
-    
-    def get_all_players(self) -> List[Dict]:
-        """Get all players from database."""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            SELECT user_id, username, region, mu, sigma, games_played, wins, losses, draws
-            FROM players ORDER BY mu DESC
-        ''')
-        
-        rows = cursor.fetchall()
-        conn.close()
-        
-        return [{
-            'user_id': row[0],
-            'username': row[1],
-            'region': row[2],
-            'mu': row[3],
-            'sigma': row[4],
-            'games_played': row[5],
-            'wins': row[6],
-            'losses': row[7],
-            'draws': row[8]
-        } for row in rows]
+    async def record_game(self, teams: List[List[int]]) -> str:
+        """Records a new game and returns the game_id."""
+        payload = {
+            "teams": teams,
+            "winning_team_index": -1  # Placeholder, not used by microservice directly
+        }
+        response = await self._request('POST', "/games/record", json=payload)
+        return response['game_id']
+
+    async def update_game_player_rating(self, game_id: str, user_id: int, new_mu: float, new_sigma: float):
+        """Updates the final rating for a player within a recorded game."""
+        return await self._request('PUT', f"/games/{game_id}/players/{user_id}/rating?new_mu={new_mu}&new_sigma={new_sigma}")
 
 class TeamBalancer:
+    """Handles the logic for balancing teams based on TrueSkill ratings."""
     @staticmethod
     def get_player_skill(player: Dict) -> float:
         """Get conservative skill estimate for a player."""
@@ -657,112 +475,146 @@ class TeamBalancer:
         
         return []
 
-class PersistentView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-class TeamCreationView(PersistentView):
-    def __init__(self, bot, teams: List[List[Dict]], waiting_room_id: int):
+class ReportMatchupModal(discord.ui.Modal, title="Report Matchup Results"):
+    """A modal for reporting the results of a game."""
+    def __init__(self, bot, teams: List[List[Dict]], game_id: str, original_message: discord.Message):
         super().__init__()
         self.bot = bot
         self.teams = teams
-        self.waiting_room_id = waiting_room_id
-        self.temp_channels = []
+        self.game_id = game_id
+        self.original_message = original_message
+        
+        # Create a dropdown for each team
+        self.team_dropdowns = []
+        for i, team in enumerate(teams):
+            team_name = f"Team {i+1} ({', '.join([p['username'] for p in team])})"
+            
+            select_menu = discord.ui.Select(
+                custom_id=f"team_result_{i}",
+                placeholder=f"Result for {team_name}",
+                options=[
+                    discord.SelectOption(label="Win", value="win", emoji="🏆"),
+                    discord.SelectOption(label="Loss", value="loss", emoji="💔"),
+                    discord.SelectOption(label="Draw", value="draw", emoji="🤝"),
+                ]
+            )
+            self.add_item(select_menu)
+            self.team_dropdowns.append(select_menu)
     
-    @discord.ui.button(label="Create Teams & Move Players", style=discord.ButtonStyle.green, emoji="🚀", custom_id="create_teams_move")
-    async def create_and_move(self, interaction: discord.Interaction, button: discord.ui.Button):
-        """Create temporary channels and move players to their teams."""
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        
+        results = [d.values[0] for d in self.team_dropdowns]
+        
+        # Basic validation of results
+        if results.count('win') > 1:
+            await self.original_message.channel.send("❌ Error: Only one team can win.", ephemeral=True)
+            return
+        if results.count('win') == 0 and 'loss' in results:
+            await self.original_message.channel.send("❌ Error: A loss requires a winner.", ephemeral=True)
+            return
+        
         try:
-            guild = interaction.guild
-            waiting_room = guild.get_channel(self.waiting_room_id)
+            # Determine ranks for TrueSkill calculation
+            ranks = [0] * len(self.teams)
+            for i, result in enumerate(results):
+                if result == 'win':
+                    ranks[i] = 0
+                elif result == 'draw':
+                    ranks[i] = 0
+                else: # 'loss'
+                    ranks[i] = 1
+
+            # Get current ratings
+            rating_groups = []
+            for team in self.teams:
+                team_ratings = [trueskill.Rating(mu=p['mu'], sigma=p['sigma']) for p in team]
+                rating_groups.append(team_ratings)
+
+            # Calculate new ratings
+            new_rating_groups = trueskill.rate(rating_groups, ranks=ranks)
+
+            # Update all players via the API
+            update_tasks = []
+            for team_idx, team in enumerate(self.teams):
+                result_str = results[team_idx]
+                for player_idx, player in enumerate(team):
+                    new_rating = new_rating_groups[team_idx][player_idx]
+                    
+                    update_tasks.append(self.bot.api.update_player_stats(player['user_id'], new_rating.mu, new_rating.sigma, result_str))
+                    update_tasks.append(self.bot.api.update_game_player_rating(self.game_id, player['user_id'], new_rating.mu, new_rating.sigma))
+
+            await asyncio.gather(*update_tasks)
             
-            if not waiting_room:
-                await interaction.response.send_message("❌ Waiting Room channel not found!", ephemeral=True)
-                return
-            
-            # Create temporary voice channels for each team
-            category = waiting_room.category
-            temp_channels = []
-            
-            for i, team in enumerate(self.teams, 1):
-                channel_name = f"Team {i} - Game {uuid.uuid4().hex[:6]}"
-                temp_channel = await guild.create_voice_channel(
-                    name=channel_name,
-                    category=category
-                )
-                temp_channels.append(temp_channel)
-                self.temp_channels.append(temp_channel)
-                
-                # Move team members to their channel
-                for player in team:
-                    member = guild.get_member(player['user_id'])
-                    if member and member.voice and member.voice.channel == waiting_room:
-                        try:
-                            await member.move_to(temp_channel)
-                        except discord.HTTPException:
-                            pass  # Member might have left or moved
-            
-            # Update the view to show End Game button
-            end_game_view = EndGameView(self.bot, self.temp_channels, self.waiting_room_id)
-            
+            # Respond with a summary and the new End Match button
             embed = discord.Embed(
-                title="🎮 Teams Created!",
-                description="Players have been moved to their team channels.",
+                title="✅ Match Results Submitted",
+                description="TrueSkill ratings have been updated!",
                 color=discord.Color.green()
             )
             
-            await interaction.response.edit_message(embed=embed, view=end_game_view)
+            for i, team in enumerate(self.teams):
+                old_ratings = rating_groups[i]
+                new_ratings = new_rating_groups[i]
+                team_text = ""
+                for p_idx, player in enumerate(team):
+                    old_mu = old_ratings[p_idx].mu
+                    new_mu = new_ratings[p_idx].mu
+                    team_text += f"**{player['username']}**: {old_mu:.1f} → {new_mu:.1f}\n"
+                
+                embed.add_field(name=f"Team {i+1} ({results[i].capitalize()})", value=team_text, inline=True)
             
-        except Exception as e:
-            await interaction.response.send_message(f"❌ Error creating teams: {str(e)}", ephemeral=True)
+            # Edit the original message with the new embed and view
+            await self.original_message.edit(embed=embed, view=EndMatchView(self.bot))
 
-class EndGameView(PersistentView):
-    def __init__(self, bot, temp_channels: List[discord.VoiceChannel], waiting_room_id: int):
-        super().__init__()
-        self.bot = bot
-        self.temp_channels = temp_channels
-        self.waiting_room_id = waiting_room_id
-    
-    @discord.ui.button(label="End Game", style=discord.ButtonStyle.red, emoji="🏁", custom_id="end_game_button")
-    async def end_game(self, interaction: discord.Interaction, button: discord.ui.Button):
-        """Move all players back to waiting room and delete temporary channels."""
-        try:
-            guild = interaction.guild
-            waiting_room = guild.get_channel(self.waiting_room_id)
-            
-            if not waiting_room:
-                await interaction.response.send_message("❌ Waiting Room channel not found!", ephemeral=True)
-                return
-            
-            # Move all players back to waiting room
-            for channel in self.temp_channels:
-                if channel:
-                    for member in channel.members:
-                        try:
-                            await member.move_to(waiting_room)
-                        except discord.HTTPException:
-                            pass
-            
-            # Delete temporary channels
-            for channel in self.temp_channels:
-                if channel:
-                    try:
-                        await channel.delete()
-                    except discord.HTTPException:
-                        pass
-            
-            embed = discord.Embed(
-                title="🏁 Game Ended",
-                description="All players moved back to Waiting Room and temporary channels deleted.",
-                color=discord.Color.blue()
-            )
-            
-            # Remove all buttons by sending a view with no items
-            empty_view = discord.ui.View()
-            await interaction.response.edit_message(embed=embed, view=empty_view)
-            
         except Exception as e:
-            await interaction.response.send_message(f"❌ Error ending game: {str(e)}", ephemeral=True)
+            await self.original_message.channel.send(f"❌ An error occurred while processing results: {e}", ephemeral=True)
+
+class EndMatchView(discord.ui.View):
+    def __init__(self, bot):
+        super().__init__(timeout=None)
+        self.bot = bot
+    
+    @discord.ui.button(label="End Match", style=discord.ButtonStyle.red, emoji="🏁", custom_id="end_match")
+    async def end_match(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        ctx = await self.bot.get_context(interaction.message)
+        await self.bot.get_command('ts cleanup').invoke(ctx)
+
+class GameReportView(discord.ui.View):
+    def __init__(self, bot, teams: List[List[Dict]], game_id: str, waiting_room_id: int):
+        super().__init__(timeout=None)
+        self.bot = bot
+        self.teams = teams
+        self.game_id = game_id
+        self.waiting_room_id = waiting_room_id
+        self.original_message: Optional[discord.Message] = None
+        self.is_report_button_enabled = False
+        self.wait_for_report_task = asyncio.create_task(self.wait_for_report_button_timer())
+
+    async def wait_for_report_button_timer(self):
+        # Wait for 10 minutes (600 seconds)
+        await asyncio.sleep(600)
+        self.is_report_button_enabled = True
+        
+        # Get the original message and edit the view to enable the button
+        if self.original_message:
+            await self.original_message.edit(view=self)
+            
+    async def on_timeout(self) -> None:
+        if self.original_message:
+            embed = self.original_message.embeds[0]
+            embed.set_footer(text="Match reporting timed out. Use `!ts cleanup` to reset.")
+            await self.original_message.edit(embed=embed, view=None)
+
+    @discord.ui.button(label="Report Matchup", style=discord.ButtonStyle.primary, emoji="📋", custom_id="report_matchup")
+    async def report_matchup(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.is_report_button_enabled:
+            await interaction.response.send_message("Please wait for 10 minutes to report the matchup.", ephemeral=True)
+            return
+
+        modal = ReportMatchupModal(self.bot, self.teams, self.game_id, self.original_message)
+        await interaction.response.send_modal(modal)
 
 class TrueSkillBot(commands.Bot):
     def __init__(self):
@@ -773,14 +625,13 @@ class TrueSkillBot(commands.Bot):
         intents.members = True
         
         super().__init__(command_prefix='!', intents=intents)
-        self.db = TrueSkillDatabase()
+        self.api = TrueSkillAPIClient(base_url=TRUESKILL_API_URL)
         self.current_teams = {}  # Store current teams by guild_id
+        self.game_ids = {} # Store game_ids by guild_id
     
     async def on_ready(self):
         print(f'{self.user} has connected to Discord!')
         print(f'Bot is in {len(self.guilds)} guilds')
-        
-        # Don't add views here - they'll be created dynamically when needed
 
 bot = TrueSkillBot()
 
@@ -818,7 +669,6 @@ async def trueskill_command(ctx):
               "`!ts teamloss <team_number>` - Award team members a loss\n"
               "`!ts teamdraw <team_number>` - Award team members a draw\n"
               "`!ts draw <team1_players...> vs <team2_players...>` - Record draw\n",
-              #"`!ts 1v1 <@winner> <@loser>` - Record 1v1 match"
         inline=False
     )
     
@@ -828,14 +678,12 @@ async def trueskill_command(ctx):
 async def update_player(ctx, member: discord.Member, region: str = None):
     """Update player information."""
     try:
-        existing_player = bot.db.get_player(member.id)
+        existing_player = await bot.api.get_player(member.id)
         if existing_player:
-            bot.db.insert_or_update_player(
+            await bot.api.insert_or_update_player(
                 member.id, 
                 member.display_name, 
-                region,
-                existing_player['mu'],
-                existing_player['sigma']
+                region
             )
             embed = discord.Embed(
                 title="✅ Player Updated",
@@ -859,7 +707,7 @@ async def update_player(ctx, member: discord.Member, region: str = None):
 async def insert_player(ctx, member: discord.Member, region: str = "Unknown"):
     """Insert a new player into the database."""
     try:
-        existing_player = bot.db.get_player(member.id)
+        existing_player = await bot.api.get_player(member.id)
         if existing_player:
             embed = discord.Embed(
                 title="⚠️ Player Already Exists",
@@ -867,7 +715,7 @@ async def insert_player(ctx, member: discord.Member, region: str = "Unknown"):
                 color=discord.Color.orange()
             )
         else:
-            bot.db.insert_or_update_player(member.id, member.display_name, region)
+            await bot.api.insert_or_update_player(member.id, member.display_name, region)
             embed = discord.Embed(
                 title="✅ Player Added",
                 description=f"Added {member.display_name} to the database.",
@@ -887,9 +735,9 @@ async def view_player(ctx, member: discord.Member = None):
         member = ctx.author
     
     try:
-        player = bot.db.get_player(member.id)
+        player = await bot.api.get_player(member.id)
         if player:
-            rating = player['mu'] - 3 * player['sigma']  # Conservative skill estimate
+            rating = player['mu'] - 3 * player['sigma']
             winrate = (player['wins'] / player['games_played'] * 100) if player['games_played'] > 0 else 0
             
             embed = discord.Embed(
@@ -920,7 +768,7 @@ async def view_player(ctx, member: discord.Member = None):
 async def leaderboard(ctx, limit: int = 20):
     """Show the leaderboard (default: top 20 players)."""
     try:
-        players = bot.db.get_all_players()
+        players = await bot.api.get_all_players()
         if not players:
             embed = discord.Embed(
                 title="📋 Leaderboard",
@@ -943,7 +791,7 @@ async def leaderboard(ctx, limit: int = 20):
             conservative_skill = player['mu'] - 3 * player['sigma']
             winrate = (player['wins'] / player['games_played'] * 100) if player['games_played'] > 0 else 0
             
-            medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else "🧙" if player['username'] == "paizen" else f"{i}."
+            medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
             leaderboard_text += f"{medal} **{player['username']}** >> {conservative_skill:.1f} ({player['games_played']} games, {winrate:.1f}% WR)\n"
         
         embed.description = leaderboard_text
@@ -967,16 +815,13 @@ async def create_teams(ctx, *, args: str = None):
         if args:
             args_list = args.strip().split()
             
-            # Check if 'random' is in the arguments
             if 'random' in args_list:
                 use_randomization = True
-                # Remove 'random' and treat remaining as region
                 args_list = [arg for arg in args_list if arg.lower() != 'random']
                 
-            # If there's still an argument left, it's the region
             if args_list:
                 region = args_list[0]
-        # Find the "Waiting Room" voice channel
+
         waiting_room = None
         for channel in ctx.guild.voice_channels:
             if channel.name.lower() == "waiting room":
@@ -992,7 +837,6 @@ async def create_teams(ctx, *, args: str = None):
             await ctx.send(embed=embed)
             return
         
-        # Get members in the waiting room
         members_in_room = waiting_room.members
         if len(members_in_room) < 2:
             embed = discord.Embed(
@@ -1003,45 +847,34 @@ async def create_teams(ctx, *, args: str = None):
             await ctx.send(embed=embed)
             return
         
-        # Check if we have too many players
         if len(members_in_room) > 20:
             embed = discord.Embed(
                 title="⚠️ Too Many Players",
-                description=f"Found {len(members_in_room)} players. Maximum supported is 20 players (5 teams × 4 players each).\n"
+                description=f"Found {len(members_in_room)} players. Maximum supported is 20 players.\n"
                           f"Only the first 20 players will be used for team balancing.",
                 color=discord.Color.orange()
             )
             await ctx.send(embed=embed)
-            members_in_room = members_in_room[:20]  # Limit to first 20 players
+            members_in_room = members_in_room[:20]
         
-        # Get player data for members in the waiting room
         players = []
         for member in members_in_room:
-            player_data = bot.db.get_player(member.id)
+            player_data = await bot.api.get_player(member.id)
             if not player_data:
-                # Auto-register new players
-                bot.db.insert_or_update_player(member.id, member.display_name)
-                player_data = bot.db.get_player(member.id)
+                await bot.api.insert_or_update_player(member.id, member.display_name)
+                player_data = await bot.api.get_player(member.id)
             players.append(player_data)
         
-        # Balance teams based on whether region is specified
         if region:
             teams = TeamBalancer.balance_teams_with_region(players, region, use_randomization)
-            
-            # Check if region-based balancing failed
             if not teams:
-                # Count players from the specified region
                 region_count = sum(1 for p in players if p.get('region', '').lower() == region.lower())
-                
                 embed = discord.Embed(
                     title="❌ Cannot Create Region-Based Teams",
                     description=f"Cannot create teams with region requirement '{region}'.\n"
-                              f"Found {region_count} players from '{region}' region.\n"
-                              f"Need at least 1 player from '{region}' to create teams.",
+                              f"Found {region_count} players from '{region}' region.",
                     color=discord.Color.red()
                 )
-                
-                # Show available regions
                 available_regions = list(set(p.get('region', 'Unknown') for p in players if p.get('region')))
                 if available_regions:
                     embed.add_field(
@@ -1049,11 +882,9 @@ async def create_teams(ctx, *, args: str = None):
                         value=", ".join(available_regions),
                         inline=False
                     )
-                
                 await ctx.send(embed=embed)
                 return
         else:
-            # Standard team balancing
             teams = TeamBalancer.balance_teams(players, use_randomization=use_randomization)
         
         if not teams:
@@ -1065,81 +896,49 @@ async def create_teams(ctx, *, args: str = None):
             await ctx.send(embed=embed)
             return
         
-        # Create embed showing team composition
         if use_randomization:
+            title = "🎲 Random Region-Based Teams" if region else "🎲 Completely Random Teams"
+            color = discord.Color.purple()
+            description = (f"Created {len(teams)} completely random teams from {len(players)} players:\n"
+                           f"🎯 Teams are randomized (ignoring TrueSkill ratings)\n"
+                           f"📊 Max 4 players per team | Max 5 teams total")
             if region:
-                embed = discord.Embed(
-                    title="🎲 Random Region-Based Teams",
-                    description=f"Created {len(teams)} completely random teams from {len(players)} players:\n"
-                               f"🌍 Each team has at least one '{region}' player\n"
-                               f"🎯 Teams are randomized (ignoring TrueSkill ratings)\n"
-                               f"📊 Max 4 players per team | Max 5 teams total",
-                    color=discord.Color.purple()
-                )
-            else:
-                embed = discord.Embed(
-                    title="🎲 Completely Random Teams",
-                    description=f"Created {len(teams)} completely random teams from {len(players)} players:\n"
-                               f"🎯 Teams are randomized (ignoring TrueSkill ratings)\n"
-                               f"📊 Max 4 players per team | Max 5 teams total",
-                    color=discord.Color.purple()
-                )
-        elif region:
-            embed = discord.Embed(
-                title="⚖️ Region-Based Balanced Teams",
-                description=f"Created {len(teams)} balanced teams from {len(players)} players:\n"
-                           f"🌍 Each team has at least one '{region}' player\n"
-                           f"📊 Max 4 players per team | Max 5 teams total",
-                color=discord.Color.green()
-            )
+                 description = (f"Created {len(teams)} completely random teams from {len(players)} players:\n"
+                                f"🌍 Each team has at least one '{region}' player\n"
+                                f"🎯 Teams are randomized (ignoring TrueSkill ratings)\n"
+                                f"📊 Max 4 players per team | Max 5 teams total")
         else:
-            embed = discord.Embed(
-                title="⚖️ Optimally Balanced Teams",
-                description=f"Created {len(teams)} optimally balanced teams from {len(players)} players:\n"
-                           f"📊 Max 4 players per team | Max 5 teams total",
-                color=discord.Color.green()
-            )
-        
+            title = "⚖️ Region-Based Balanced Teams" if region else "⚖️ Optimally Balanced Teams"
+            color = discord.Color.green()
+            description = (f"Created {len(teams)} optimally balanced teams from {len(players)} players:\n"
+                           f"📊 Max 4 players per team | Max 5 teams total")
+            if region:
+                 description = (f"Created {len(teams)} balanced teams from {len(players)} players:\n"
+                                f"🌍 Each team has at least one '{region}' player\n"
+                                f"📊 Max 4 players per team | Max 5 teams total")
+
+        embed = discord.Embed(title=title, description=description, color=color)
+
         for i, team in enumerate(teams, 1):
-            if use_randomization:
-                # For random teams, just show players without skill ratings
-                team_text = ""
-                for player in team:
-                    if region:
-                        # Show region info when using region-based balancing
-                        player_region = player.get('region', 'Unknown')
-                        region_indicator = " 🌍" if player_region.lower() == region.lower() else ""
-                        team_text += f"• {player['username']} [{player_region}]{region_indicator}\n"
-                    else:
-                        team_text += f"• {player['username']}\n"
-                
-                embed.add_field(
-                    name=f"Team {i} ({len(team)} players)",
-                    value=team_text,
-                    inline=True
-                )
-            else:
-                # For balanced teams, show skill ratings
-                team_strength = sum(TeamBalancer.get_player_skill(p) for p in team) / len(team)
-                team_text = ""
-                
-                for player in team:
+            team_text = ""
+            for player in team:
+                if use_randomization:
+                    player_region = player.get('region', 'Unknown')
+                    region_indicator = " 🌍" if region and player_region.lower() == region.lower() else ""
+                    team_text += f"• {player['username']} [{player_region}]{region_indicator}\n"
+                else:
                     conservative_skill = TeamBalancer.get_player_skill(player)
-                    if region:
-                        # Show region info when using region-based balancing
-                        player_region = player.get('region', 'Unknown')
-                        region_indicator = " 🌍" if player_region.lower() == region.lower() else ""
-                        team_text += f"• {player['username']} ({conservative_skill:.1f}) [{player_region}]{region_indicator}\n"
-                    else:
-                        team_text += f"• {player['username']} ({conservative_skill:.1f})\n"
-                
-                embed.add_field(
-                    name=f"Team {i} (Avg: {team_strength:.1f})",
-                    value=team_text,
-                    inline=True
-                )
-        
-        # Add balance statistics (only for balanced teams, not random)
+                    player_region = player.get('region', 'Unknown')
+                    region_indicator = " 🌍" if region and player_region.lower() == region.lower() else ""
+                    team_text += f"• {player['username']} ({conservative_skill:.1f}) [{player_region}]{region_indicator}\n"
+            
+            if use_randomization:
+                field_name = f"Team {i} ({len(team)} players)"
+            else:
+                team_strength = TeamBalancer.calculate_team_average(team)
+                field_name = f"Team {i} (Avg: {team_strength:.1f})"
+            embed.add_field(name=field_name, value=team_text, inline=True)
+
         if not use_randomization:
             team_averages = [TeamBalancer.calculate_team_average(team) for team in teams]
             if len(team_averages) > 1:
@@ -1147,7 +946,6 @@ async def create_teams(ctx, *, args: str = None):
                 max_avg = max(team_averages)
                 variance = TeamBalancer.calculate_variance(teams)
                 balance_quality = "Excellent" if variance < 0.5 else "Good" if variance < 2.0 else "Fair"
-                
                 embed.add_field(
                     name="🎯 Balance Quality",
                     value=f"{balance_quality}\n"
@@ -1156,12 +954,16 @@ async def create_teams(ctx, *, args: str = None):
                     inline=True
                 )
         
-        # Store teams for win/loss tracking
         bot.current_teams[ctx.guild.id] = teams
         
-        # Create view with persistent buttons
-        view = TeamCreationView(bot, teams, waiting_room.id)
-        await ctx.send(embed=embed, view=view)
+        teams_user_ids = [[p['user_id'] for p in team] for team in teams]
+        game_id = await bot.api.record_game(teams_user_ids)
+        bot.game_ids[ctx.guild.id] = game_id
+
+        # Use the new view with the delayed button
+        view = GameReportView(bot, teams, game_id, waiting_room.id)
+        message = await ctx.send(embed=embed, view=view)
+        view.original_message = message
         
     except Exception as e:
         await ctx.send(f"❌ Error creating teams: {str(e)}")
@@ -1170,7 +972,6 @@ async def create_teams(ctx, *, args: str = None):
 async def cleanup_teams(ctx):
     """Move all players back to Waiting Room and delete temporary channels."""
     try:
-        # Find the "Waiting Room" voice channel
         waiting_room = None
         for channel in ctx.guild.voice_channels:
             if channel.name.lower() == "waiting room":
@@ -1186,40 +987,36 @@ async def cleanup_teams(ctx):
             await ctx.send(embed=embed)
             return
         
-        # Find all temporary team channels (channels that start with "Team " and contain " - Game ")
         temp_channels = []
         players_moved = 0
         channels_deleted = 0
         
         for channel in ctx.guild.voice_channels:
-            # Check if this looks like a temporary team channel
             if (channel.name.startswith("Team ") and " - Game " in channel.name) or \
                ("team" in channel.name.lower() and channel != waiting_room and 
                 channel.category == waiting_room.category):
                 temp_channels.append(channel)
         
-        # Move all players from temporary channels back to waiting room
         for channel in temp_channels:
-            for member in list(channel.members):  # Use list() to avoid modification during iteration
+            for member in list(channel.members):
                 try:
                     await member.move_to(waiting_room)
                     players_moved += 1
                 except discord.HTTPException:
-                    pass  # Member might have left or moved already
+                    pass
         
-        # Delete temporary channels
         for channel in temp_channels:
             try:
                 await channel.delete()
                 channels_deleted += 1
             except discord.HTTPException:
-                pass  # Channel might already be deleted or no permission
+                pass
         
-        # Clear stored teams for this guild
         if ctx.guild.id in bot.current_teams:
             del bot.current_teams[ctx.guild.id]
+        if ctx.guild.id in bot.game_ids:
+            del bot.game_ids[ctx.guild.id]
         
-        # Create success embed
         embed = discord.Embed(
             title="🧹 Cleanup Complete",
             description="Successfully cleaned up team channels and moved players back.",
@@ -1241,24 +1038,33 @@ async def cleanup_teams(ctx):
     except Exception as e:
         await ctx.send(f"❌ Error during cleanup: {str(e)}")
 
+# Error handlers
+@update_player.error
+@insert_player.error
+@view_player.error
+async def player_command_error(ctx, error):
+    if isinstance(error, commands.MemberNotFound):
+        await ctx.send("❌ Member not found. Please mention a valid user.")
+    elif isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send("❌ Missing required argument. Please check the command usage.")
+
+@cleanup_teams.error
+async def cleanup_command_error(ctx, error):
+    await ctx.send(f"❌ Error during cleanup: {str(error)}")
+
 @trueskill_command.command(name='win')
 async def record_win(ctx, member: discord.Member):
     """Record a win for a specific user."""
     try:
-        # Check if player exists in database
-        player = bot.db.get_player(member.id)
+        player = await bot.api.get_player(member.id)
         if not player:
-            # Auto-register new player
-            bot.db.insert_or_update_player(member.id, member.display_name)
-            player = bot.db.get_player(member.id)
+            await bot.api.insert_or_update_player(member.id, member.display_name)
+            player = await bot.api.get_player(member.id)
         
-        # Create a basic rating increase for a win
         old_rating = trueskill.Rating(mu=player['mu'], sigma=player['sigma'])
-        # Simulate a win against an average opponent
         new_rating = trueskill.rate([[old_rating], [trueskill.Rating()]])[0][0]
         
-        # Update player stats
-        bot.db.update_player_stats(member.id, new_rating, 'win')
+        await bot.api.update_player_stats(member.id, new_rating.mu, new_rating.sigma, 'win')
         
         embed = discord.Embed(
             title="✅ Win Recorded",
@@ -1277,20 +1083,15 @@ async def record_win(ctx, member: discord.Member):
 async def record_loss(ctx, member: discord.Member):
     """Record a loss for a specific user."""
     try:
-        # Check if player exists in database
-        player = bot.db.get_player(member.id)
+        player = await bot.api.get_player(member.id)
         if not player:
-            # Auto-register new player
-            bot.db.insert_or_update_player(member.id, member.display_name)
-            player = bot.db.get_player(member.id)
+            await bot.api.insert_or_update_player(member.id, member.display_name)
+            player = await bot.api.get_player(member.id)
         
-        # Create a basic rating decrease for a loss
         old_rating = trueskill.Rating(mu=player['mu'], sigma=player['sigma'])
-        # Simulate a loss against an average opponent
         new_rating = trueskill.rate([[old_rating], [trueskill.Rating()]])[1][0]
         
-        # Update player stats
-        bot.db.update_player_stats(member.id, new_rating, 'loss')
+        await bot.api.update_player_stats(member.id, new_rating.mu, new_rating.sigma, 'loss')
         
         embed = discord.Embed(
             title="❌ Loss Recorded",
@@ -1309,23 +1110,17 @@ async def record_loss(ctx, member: discord.Member):
 async def record_draw(ctx, member: discord.Member):
     """Record a draw for a specific user."""
     try:
-        # Check if player exists in database
-        player = bot.db.get_player(member.id)
+        player = await bot.api.get_player(member.id)
         if not player:
-            # Auto-register new player
-            bot.db.insert_or_update_player(member.id, member.display_name)
-            player = bot.db.get_player(member.id)
+            await bot.api.insert_or_update_player(member.id, member.display_name)
+            player = await bot.api.get_player(member.id)
         
-        # For a draw, rating stays mostly the same but uncertainty might change slightly
         old_rating = trueskill.Rating(mu=player['mu'], sigma=player['sigma'])
-        # Simulate a draw - rating should stay close to the same
-        # We'll use a small adjustment by rating against an equal opponent as a draw
         rating_groups = [[old_rating], [trueskill.Rating(mu=player['mu'], sigma=player['sigma'])]]
-        new_rating_groups = trueskill.rate(rating_groups, ranks=[0, 0])  # Both get rank 0 (tie)
+        new_rating_groups = trueskill.rate(rating_groups, ranks=[0, 0])
         new_rating = new_rating_groups[0][0]
         
-        # Update player stats
-        bot.db.update_player_stats(member.id, new_rating, 'draw')
+        await bot.api.update_player_stats(member.id, new_rating.mu, new_rating.sigma, 'draw')
         
         embed = discord.Embed(
             title="🤝 Draw Recorded",
@@ -1340,216 +1135,19 @@ async def record_draw(ctx, member: discord.Member):
     except Exception as e:
         await ctx.send(f"❌ Error recording draw: {str(e)}")
 
+# This section of commands is no longer used due to the new button-driven flow.
+# They are kept here for reference but can be removed.
 @trueskill_command.command(name='teamwin')
 async def record_team_win(ctx, team_number: int):
-    """Record a win for all members of a specific team."""
-    try:
-        # Check if there are current teams
-        if ctx.guild.id not in bot.current_teams or not bot.current_teams[ctx.guild.id]:
-            embed = discord.Embed(
-                title="❌ No Active Teams",
-                description="No teams found. Use `!ts teams` to create teams first.",
-                color=discord.Color.red()
-            )
-            await ctx.send(embed=embed)
-            return
-        
-        teams = bot.current_teams[ctx.guild.id]
-        
-        # Validate team number
-        if team_number < 1 or team_number > len(teams):
-            embed = discord.Embed(
-                title="❌ Invalid Team Number",
-                description=f"Team number must be between 1 and {len(teams)}.",
-                color=discord.Color.red()
-            )
-            await ctx.send(embed=embed)
-            return
-        
-        winning_team = teams[team_number - 1]
-        wins_recorded = []
-        
-        # Record wins for all team members
-        for player_data in winning_team:
-            old_rating = trueskill.Rating(mu=player_data['mu'], sigma=player_data['sigma'])
-            # Simulate a win against an average opponent
-            new_rating = trueskill.rate([[old_rating], [trueskill.Rating()]])[0][0]
-            
-            # Update player stats
-            bot.db.update_player_stats(player_data['user_id'], new_rating, 'win')
-            wins_recorded.append({
-                'name': player_data['username'],
-                'old_rating': old_rating,
-                'new_rating': new_rating
-            })
-        
-        embed = discord.Embed(
-            title=f"🏆 Team {team_number} Win Recorded",
-            description=f"Recorded wins for all {len(winning_team)} members of Team {team_number}",
-            color=discord.Color.green()
-        )
-        
-        for win in wins_recorded:
-            embed.add_field(
-                name=win['name'],
-                value=f"{win['old_rating'].mu:.1f} → {win['new_rating'].mu:.1f}",
-                inline=True
-            )
-        
-        await ctx.send(embed=embed)
-        
-    except Exception as e:
-        await ctx.send(f"❌ Error recording team win: {str(e)}")
+    await ctx.send("This command is deprecated. Please use the 'Report Matchup' button to record game results.")
 
 @trueskill_command.command(name='teamloss')
 async def record_team_loss(ctx, team_number: int):
-    """Record a loss for all members of a specific team."""
-    try:
-        # Check if there are current teams
-        if ctx.guild.id not in bot.current_teams or not bot.current_teams[ctx.guild.id]:
-            embed = discord.Embed(
-                title="❌ No Active Teams",
-                description="No teams found. Use `!ts teams` to create teams first.",
-                color=discord.Color.red()
-            )
-            await ctx.send(embed=embed)
-            return
-        
-        teams = bot.current_teams[ctx.guild.id]
-        
-        # Validate team number
-        if team_number < 1 or team_number > len(teams):
-            embed = discord.Embed(
-                title="❌ Invalid Team Number",
-                description=f"Team number must be between 1 and {len(teams)}.",
-                color=discord.Color.red()
-            )
-            await ctx.send(embed=embed)
-            return
-        
-        losing_team = teams[team_number - 1]
-        losses_recorded = []
-        
-        # Record losses for all team members
-        for player_data in losing_team:
-            old_rating = trueskill.Rating(mu=player_data['mu'], sigma=player_data['sigma'])
-            # Simulate a loss against an average opponent
-            new_rating = trueskill.rate([[old_rating], [trueskill.Rating()]])[1][0]
-            
-            # Update player stats
-            bot.db.update_player_stats(player_data['user_id'], new_rating, 'loss')
-            losses_recorded.append({
-                'name': player_data['username'],
-                'old_rating': old_rating,
-                'new_rating': new_rating
-            })
-        
-        embed = discord.Embed(
-            title=f"💔 Team {team_number} Loss Recorded",
-            description=f"Recorded losses for all {len(losing_team)} members of Team {team_number}",
-            color=discord.Color.red()
-        )
-        
-        for loss in losses_recorded:
-            embed.add_field(
-                name=loss['name'],
-                value=f"{loss['old_rating'].mu:.1f} → {loss['new_rating'].mu:.1f}",
-                inline=True
-            )
-        
-        await ctx.send(embed=embed)
-        
-    except Exception as e:
-        await ctx.send(f"❌ Error recording team loss: {str(e)}")
+    await ctx.send("This command is deprecated. Please use the 'Report Matchup' button to record game results.")
 
 @trueskill_command.command(name='teamdraw')
-async def record_team_draw(ctx, team_number: int):
-    """Record a draw for all members of a specific team."""
-    try:
-        # Check if there are current teams
-        if ctx.guild.id not in bot.current_teams or not bot.current_teams[ctx.guild.id]:
-            embed = discord.Embed(
-                title="❌ No Active Teams",
-                description="No teams found. Use `!ts teams` to create teams first.",
-                color=discord.Color.red()
-            )
-            await ctx.send(embed=embed)
-            return
-        
-        teams = bot.current_teams[ctx.guild.id]
-        
-        # Validate team number
-        if team_number < 1 or team_number > len(teams):
-            embed = discord.Embed(
-                title="❌ Invalid Team Number",
-                description=f"Team number must be between 1 and {len(teams)}.",
-                color=discord.Color.red()
-            )
-            await ctx.send(embed=embed)
-            return
-        
-        drawing_team = teams[team_number - 1]
-        draws_recorded = []
-        
-        # Record draws for all team members
-        for player_data in drawing_team:
-            old_rating = trueskill.Rating(mu=player_data['mu'], sigma=player_data['sigma'])
-            # Simulate a draw against an equal opponent
-            rating_groups = [[old_rating], [trueskill.Rating(mu=player_data['mu'], sigma=player_data['sigma'])]]
-            new_rating_groups = trueskill.rate(rating_groups, ranks=[0, 0])  # Both get rank 0 (tie)
-            new_rating = new_rating_groups[0][0]
-            
-            # Update player stats
-            bot.db.update_player_stats(player_data['user_id'], new_rating, 'draw')
-            draws_recorded.append({
-                'name': player_data['username'],
-                'old_rating': old_rating,
-                'new_rating': new_rating
-            })
-        
-        embed = discord.Embed(
-            title=f"🤝 Team {team_number} Draw Recorded",
-            description=f"Recorded draws for all {len(drawing_team)} members of Team {team_number}",
-            color=discord.Color.orange()
-        )
-        
-        for draw in draws_recorded:
-            embed.add_field(
-                name=draw['name'],
-                value=f"{draw['old_rating'].mu:.1f} → {draw['new_rating'].mu:.1f}",
-                inline=True
-            )
-        
-        await ctx.send(embed=embed)
-        
-    except Exception as e:
-        await ctx.send(f"❌ Error recording team draw: {str(e)}")
-
-# Error handlers
-@update_player.error
-@insert_player.error
-@view_player.error
-@record_win.error
-@record_loss.error
-@record_draw.error
-async def player_command_error(ctx, error):
-    if isinstance(error, commands.MemberNotFound):
-        await ctx.send("❌ Member not found. Please mention a valid user.")
-    elif isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send("❌ Missing required argument. Please check the command usage.")
-
-@record_team_win.error
-@record_team_loss.error
-@record_team_draw.error
-async def team_command_error(ctx, error):
-    if isinstance(error, commands.BadArgument):
-        await ctx.send("❌ Invalid team number. Please provide a valid number.")
-    elif isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send("❌ Missing team number. Usage: `!ts teamwin <team_number>`, `!ts teamloss <team_number>`, or `!ts teamdraw <team_number>`")
-
-@cleanup_teams.error
-async def cleanup_command_error(ctx, error):
-    await ctx.send(f"❌ Error during cleanup: {str(error)}")
+async def record_team_draw(ctx, *team_numbers: int):
+    await ctx.send("This command is deprecated. Please use the 'Report Matchup' button to record game results.")
 
 # Run the bot
 if __name__ == "__main__":
