@@ -589,18 +589,7 @@ class GameReportView(discord.ui.View):
         self.game_id = game_id
         self.waiting_room_id = waiting_room_id
         self.original_message: Optional[discord.Message] = None
-        self.is_report_button_enabled = False
-        self.wait_for_report_task = asyncio.create_task(self.wait_for_report_button_timer())
 
-    async def wait_for_report_button_timer(self):
-        # Wait for 10 minutes (600 seconds)
-        await asyncio.sleep(600)
-        self.is_report_button_enabled = True
-        
-        # Get the original message and edit the view to enable the button
-        if self.original_message:
-            await self.original_message.edit(view=self)
-            
     async def on_timeout(self) -> None:
         if self.original_message:
             embed = self.original_message.embeds[0]
@@ -609,10 +598,6 @@ class GameReportView(discord.ui.View):
 
     @discord.ui.button(label="Report Matchup", style=discord.ButtonStyle.primary, emoji="📋", custom_id="report_matchup")
     async def report_matchup(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not self.is_report_button_enabled:
-            await interaction.response.send_message("Please wait for 10 minutes to report the matchup.", ephemeral=True)
-            return
-
         modal = ReportMatchupModal(self.bot, self.teams, self.game_id, self.original_message)
         await interaction.response.send_modal(modal)
 
