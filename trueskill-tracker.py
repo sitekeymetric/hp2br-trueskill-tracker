@@ -475,6 +475,59 @@ class TeamBalancer:
         
         return []
 
+class TeamCreationView(discord.ui.View):
+    def __init__(self, bot, teams: List[List[Dict]], game_id: str, waiting_room_id: int, original_message: discord.Message):
+        super().__init__(timeout=None)
+        self.bot = bot
+        self.teams = teams
+        self.game_id = game_id
+        self.waiting_room_id = waiting_room_id
+        self.original_message = original_message
+
+    @discord.ui.button(label="Create Team & Move Players", style=discord.ButtonStyle.green, emoji="🚀", custom_id="create_move_players")
+    async def create_and_move(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Create temporary channels and move players to their teams."""
+        await interaction.response.defer()
+
+        guild = interaction.guild
+        waiting_room = guild.get_channel(self.waiting_room_id)
+        if not waiting_room:
+            await interaction.followup.send("❌ Waiting Room channel not found!", ephemeral=True)
+            return
+
+        category = waiting_room.category
+        temp_channels = []
+
+        for i, team in enumerate(self.teams, 1):
+            channel_name = f"Team {i} - Game {self.game_id[:6]}"
+            try:
+                temp_channel = await guild.create_voice_channel(name=channel_name, category=category)
+                temp_channels.append(temp_channel)
+
+                for player in team:
+                    member = guild.get_member(player['user_id'])
+                    if member and member.voice and member.voice.channel == waiting_room:
+                        await member.move_to(temp_channel)
+            except (discord.Forbidden, discord.HTTPException) as e:
+                await interaction.followup.send(f"❌ Error creating channels or moving players: {e}", ephemeral=True)
+                # Clean up already created channels
+                for ch in temp_channels:
+                    await ch.delete()
+                return
+
+        embed = discord.Embed(
+            title="🎮 Teams Created & Players Moved",
+            description="The match can now begin. Use the button below to report results when finished.",
+            color=discord.Color.blue()
+        )
+
+        # Transition to the report view
+        report_view = GameReportView(self.bot, self.teams, self.game_id, self.waiting_room_id)
+        report_view.original_message = self.original_message
+
+        if self.original_message:
+            await self.original_message.edit(embed=embed, view=report_view)
+
 class ReportMatchupModal(discord.ui.Modal, title="Report Matchup Results"):
     """A modal for reporting the results of a game."""
     def __init__(self, bot, teams: List[List[Dict]], game_id: str, original_message: discord.Message):
@@ -945,10 +998,10 @@ async def create_teams(ctx, *, args: str = None):
         game_id = await bot.api.record_game(teams_user_ids)
         bot.game_ids[ctx.guild.id] = game_id
 
-        # Use the new view with the delayed button
-        view = GameReportView(bot, teams, game_id, waiting_room.id)
-        message = await ctx.send(embed=embed, view=view)
-        view.original_message = message
+        # Use the new interactive view
+        message = await ctx.send(embed=embed)
+        view = TeamCreationView(bot, teams, game_id, waiting_room.id, message)
+        await message.edit(view=view)
         
     except Exception as e:
         await ctx.send(f"❌ Error creating teams: {str(e)}")
