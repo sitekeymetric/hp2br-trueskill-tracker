@@ -771,103 +771,69 @@ class MatchupView(PersistentView):
         self.teams = teams
         self.guild_id = guild_id
         
-        # Create buttons for each team
-        for i, team in enumerate(teams, 1):
-            # Win button
+        # Create a "Win" button for each team
+        for i, team in enumerate(teams):
             win_button = discord.ui.Button(
-                label=f"Team {i} Win",
+                label=f"Team {i + 1} Wins",
                 style=discord.ButtonStyle.green,
                 emoji="🏆",
                 custom_id=f"team_{i}_win"
             )
-            win_button.callback = self._create_team_callback(i - 1, 'win')
+            win_button.callback = self.create_win_callback(i)
             self.add_item(win_button)
-            
-            # Loss button
-            loss_button = discord.ui.Button(
-                label=f"Team {i} Loss",
-                style=discord.ButtonStyle.red,
-                emoji="💔",
-                custom_id=f"team_{i}_loss"
-            )
-            loss_button.callback = self._create_team_callback(i - 1, 'loss')
-            self.add_item(loss_button)
-            
-            # Draw button
-            draw_button = discord.ui.Button(
-                label=f"Team {i} Draw",
-                style=discord.ButtonStyle.grey,
-                emoji="🤝",
-                custom_id=f"team_{i}_draw"
-            )
-            draw_button.callback = self._create_team_callback(i - 1, 'draw')
-            self.add_item(draw_button)
+
+        # Create a "Draw" button
+        draw_button = discord.ui.Button(
+            label="Record a Draw",
+            style=discord.ButtonStyle.grey,
+            emoji="🤝",
+            custom_id="record_draw"
+        )
+        draw_button.callback = self.create_draw_callback()
+        self.add_item(draw_button)
     
-    def _create_team_callback(self, team_index: int, result: str):
-        """Create a callback function for team result buttons."""
+    def create_win_callback(self, winning_team_index: int):
         async def callback(interaction: discord.Interaction):
             try:
-                team = self.teams[team_index]
-                team_number = team_index + 1
-                results_recorded = []
+                # Get player IDs for each team
+                team_user_ids = []
+                for team in self.teams:
+                    team_user_ids.append([player['user_id'] for player in team])
+
+                # Record the game result
+                game_id = self.bot.db.record_game_result(team_user_ids, winning_team_index)
                 
-                # Record result for all team members
-                for player_data in team:
-                    old_rating = trueskill.Rating(mu=player_data['mu'], sigma=player_data['sigma'])
-                    
-                    if result == 'win':
-                        # Simulate a win against an average opponent
-                        new_rating = trueskill.rate([[old_rating], [trueskill.Rating()]])[0][0]
-                    elif result == 'loss':
-                        # Simulate a loss against an average opponent
-                        new_rating = trueskill.rate([[old_rating], [trueskill.Rating()]])[1][0]
-                    else:  # draw
-                        # Simulate a draw against an equal opponent
-                        rating_groups = [[old_rating], [trueskill.Rating(mu=player_data['mu'], sigma=player_data['sigma'])]]
-                        new_rating_groups = trueskill.rate(rating_groups, ranks=[0, 0])  # Both get rank 0 (tie)
-                        new_rating = new_rating_groups[0][0]
-                    
-                    # Update player stats
-                    self.bot.db.update_player_stats(player_data['user_id'], new_rating, result)
-                    results_recorded.append({
-                        'name': player_data['username'],
-                        'old_rating': old_rating,
-                        'new_rating': new_rating
-                    })
-                
-                # Create response embed
-                if result == 'win':
-                    embed = discord.Embed(
-                        title=f"🏆 Team {team_number} Win Recorded",
-                        description=f"Recorded wins for all {len(team)} members of Team {team_number}",
-                        color=discord.Color.green()
-                    )
-                elif result == 'loss':
-                    embed = discord.Embed(
-                        title=f"💔 Team {team_number} Loss Recorded",
-                        description=f"Recorded losses for all {len(team)} members of Team {team_number}",
-                        color=discord.Color.red()
-                    )
-                else:  # draw
-                    embed = discord.Embed(
-                        title=f"🤝 Team {team_number} Draw Recorded",
-                        description=f"Recorded draws for all {len(team)} members of Team {team_number}",
-                        color=discord.Color.orange()
-                    )
-                
-                # Add rating changes for each player
-                for record in results_recorded:
-                    embed.add_field(
-                        name=record['name'],
-                        value=f"{record['old_rating'].mu:.1f} → {record['new_rating'].mu:.1f}",
-                        inline=True
-                    )
-                
-                await interaction.response.send_message(embed=embed, ephemeral=True)
-                
+                # Create a response embed
+                embed = discord.Embed(
+                    title=f"🏆 Team {winning_team_index + 1} Wins!",
+                    description=f"Game result recorded (ID: {game_id}). Player ratings have been updated.",
+                    color=discord.Color.green()
+                )
+                await interaction.response.edit_message(embed=embed, view=None)
             except Exception as e:
-                await interaction.response.send_message(f"❌ Error recording {result}: {str(e)}", ephemeral=True)
-        
+                await interaction.response.send_message(f"❌ Error recording win: {str(e)}", ephemeral=True)
+        return callback
+
+    def create_draw_callback(self):
+        async def callback(interaction: discord.Interaction):
+            try:
+                # Get player IDs for each team
+                team_user_ids = []
+                for team in self.teams:
+                    team_user_ids.append([player['user_id'] for player in team])
+                
+                # Record the game result as a draw
+                game_id = self.bot.db.record_game_result(team_user_ids, -1) # -1 for a draw
+                
+                # Create a response embed
+                embed = discord.Embed(
+                    title="🤝 Game was a Draw",
+                    description=f"Game result recorded (ID: {game_id}). Player ratings have been updated.",
+                    color=discord.Color.orange()
+                )
+                await interaction.response.edit_message(embed=embed, view=None)
+            except Exception as e:
+                await interaction.response.send_message(f"❌ Error recording draw: {str(e)}", ephemeral=True)
         return callback
 
 class TrueSkillBot(commands.Bot):
@@ -920,10 +886,7 @@ async def trueskill_command(ctx):
         value="`!ts win <@user>` - Record a win for user\n"
               "`!ts loss <@user>` - Record a loss for user\n"
               "`!ts draw <@user>` - Record a draw for user\n"
-              "`!ts teamwin <team_number>` - Award team members a win\n"
-              "`!ts teamloss <team_number>` - Award team members a loss\n"
-              "`!ts teamdraw <team_number>` - Award team members a draw\n"
-              "`!ts matchup` - Interactive matchup interface with win/loss/draw buttons\n"
+              "`!ts matchup` - Create an interactive interface to record team wins or draws\n"
               "`!ts draw <team1_players...> vs <team2_players...>` - Record draw\n",
               #"`!ts 1v1 <@winner> <@loser>` - Record 1v1 match"
         inline=False
@@ -1447,191 +1410,6 @@ async def record_draw(ctx, member: discord.Member):
     except Exception as e:
         await ctx.send(f"❌ Error recording draw: {str(e)}")
 
-@trueskill_command.command(name='teamwin')
-async def record_team_win(ctx, team_number: int):
-    """Record a win for all members of a specific team."""
-    try:
-        # Check if there are current teams
-        if ctx.guild.id not in bot.current_teams or not bot.current_teams[ctx.guild.id]:
-            embed = discord.Embed(
-                title="❌ No Active Teams",
-                description="No teams found. Use `!ts teams` to create teams first.",
-                color=discord.Color.red()
-            )
-            await ctx.send(embed=embed)
-            return
-        
-        teams = bot.current_teams[ctx.guild.id]
-        
-        # Validate team number
-        if team_number < 1 or team_number > len(teams):
-            embed = discord.Embed(
-                title="❌ Invalid Team Number",
-                description=f"Team number must be between 1 and {len(teams)}.",
-                color=discord.Color.red()
-            )
-            await ctx.send(embed=embed)
-            return
-        
-        winning_team = teams[team_number - 1]
-        wins_recorded = []
-        
-        # Record wins for all team members
-        for player_data in winning_team:
-            old_rating = trueskill.Rating(mu=player_data['mu'], sigma=player_data['sigma'])
-            # Simulate a win against an average opponent
-            new_rating = trueskill.rate([[old_rating], [trueskill.Rating()]])[0][0]
-            
-            # Update player stats
-            bot.db.update_player_stats(player_data['user_id'], new_rating, 'win')
-            wins_recorded.append({
-                'name': player_data['username'],
-                'old_rating': old_rating,
-                'new_rating': new_rating
-            })
-        
-        embed = discord.Embed(
-            title=f"🏆 Team {team_number} Win Recorded",
-            description=f"Recorded wins for all {len(winning_team)} members of Team {team_number}",
-            color=discord.Color.green()
-        )
-        
-        for win in wins_recorded:
-            embed.add_field(
-                name=win['name'],
-                value=f"{win['old_rating'].mu:.1f} → {win['new_rating'].mu:.1f}",
-                inline=True
-            )
-        
-        await ctx.send(embed=embed)
-        
-    except Exception as e:
-        await ctx.send(f"❌ Error recording team win: {str(e)}")
-
-@trueskill_command.command(name='teamloss')
-async def record_team_loss(ctx, team_number: int):
-    """Record a loss for all members of a specific team."""
-    try:
-        # Check if there are current teams
-        if ctx.guild.id not in bot.current_teams or not bot.current_teams[ctx.guild.id]:
-            embed = discord.Embed(
-                title="❌ No Active Teams",
-                description="No teams found. Use `!ts teams` to create teams first.",
-                color=discord.Color.red()
-            )
-            await ctx.send(embed=embed)
-            return
-        
-        teams = bot.current_teams[ctx.guild.id]
-        
-        # Validate team number
-        if team_number < 1 or team_number > len(teams):
-            embed = discord.Embed(
-                title="❌ Invalid Team Number",
-                description=f"Team number must be between 1 and {len(teams)}.",
-                color=discord.Color.red()
-            )
-            await ctx.send(embed=embed)
-            return
-        
-        losing_team = teams[team_number - 1]
-        losses_recorded = []
-        
-        # Record losses for all team members
-        for player_data in losing_team:
-            old_rating = trueskill.Rating(mu=player_data['mu'], sigma=player_data['sigma'])
-            # Simulate a loss against an average opponent
-            new_rating = trueskill.rate([[old_rating], [trueskill.Rating()]])[1][0]
-            
-            # Update player stats
-            bot.db.update_player_stats(player_data['user_id'], new_rating, 'loss')
-            losses_recorded.append({
-                'name': player_data['username'],
-                'old_rating': old_rating,
-                'new_rating': new_rating
-            })
-        
-        embed = discord.Embed(
-            title=f"💔 Team {team_number} Loss Recorded",
-            description=f"Recorded losses for all {len(losing_team)} members of Team {team_number}",
-            color=discord.Color.red()
-        )
-        
-        for loss in losses_recorded:
-            embed.add_field(
-                name=loss['name'],
-                value=f"{loss['old_rating'].mu:.1f} → {loss['new_rating'].mu:.1f}",
-                inline=True
-            )
-        
-        await ctx.send(embed=embed)
-        
-    except Exception as e:
-        await ctx.send(f"❌ Error recording team loss: {str(e)}")
-
-@trueskill_command.command(name='teamdraw')
-async def record_team_draw(ctx, team_number: int):
-    """Record a draw for all members of a specific team."""
-    try:
-        # Check if there are current teams
-        if ctx.guild.id not in bot.current_teams or not bot.current_teams[ctx.guild.id]:
-            embed = discord.Embed(
-                title="❌ No Active Teams",
-                description="No teams found. Use `!ts teams` to create teams first.",
-                color=discord.Color.red()
-            )
-            await ctx.send(embed=embed)
-            return
-        
-        teams = bot.current_teams[ctx.guild.id]
-        
-        # Validate team number
-        if team_number < 1 or team_number > len(teams):
-            embed = discord.Embed(
-                title="❌ Invalid Team Number",
-                description=f"Team number must be between 1 and {len(teams)}.",
-                color=discord.Color.red()
-            )
-            await ctx.send(embed=embed)
-            return
-        
-        drawing_team = teams[team_number - 1]
-        draws_recorded = []
-        
-        # Record draws for all team members
-        for player_data in drawing_team:
-            old_rating = trueskill.Rating(mu=player_data['mu'], sigma=player_data['sigma'])
-            # Simulate a draw against an equal opponent
-            rating_groups = [[old_rating], [trueskill.Rating(mu=player_data['mu'], sigma=player_data['sigma'])]]
-            new_rating_groups = trueskill.rate(rating_groups, ranks=[0, 0])  # Both get rank 0 (tie)
-            new_rating = new_rating_groups[0][0]
-            
-            # Update player stats
-            bot.db.update_player_stats(player_data['user_id'], new_rating, 'draw')
-            draws_recorded.append({
-                'name': player_data['username'],
-                'old_rating': old_rating,
-                'new_rating': new_rating
-            })
-        
-        embed = discord.Embed(
-            title=f"🤝 Team {team_number} Draw Recorded",
-            description=f"Recorded draws for all {len(drawing_team)} members of Team {team_number}",
-            color=discord.Color.orange()
-        )
-        
-        for draw in draws_recorded:
-            embed.add_field(
-                name=draw['name'],
-                value=f"{draw['old_rating'].mu:.1f} → {draw['new_rating'].mu:.1f}",
-                inline=True
-            )
-        
-        await ctx.send(embed=embed)
-        
-    except Exception as e:
-        await ctx.send(f"❌ Error recording team draw: {str(e)}")
-
 # Error handlers
 @update_player.error
 @insert_player.error
@@ -1644,15 +1422,6 @@ async def player_command_error(ctx, error):
         await ctx.send("❌ Member not found. Please mention a valid user.")
     elif isinstance(error, commands.MissingRequiredArgument):
         await ctx.send("❌ Missing required argument. Please check the command usage.")
-
-@record_team_win.error
-@record_team_loss.error
-@record_team_draw.error
-async def team_command_error(ctx, error):
-    if isinstance(error, commands.BadArgument):
-        await ctx.send("❌ Invalid team number. Please provide a valid number.")
-    elif isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send("❌ Missing team number. Usage: `!ts teamwin <team_number>`, `!ts teamloss <team_number>`, or `!ts teamdraw <team_number>`")
 
 @trueskill_command.command(name='matchup')
 async def matchup_interface(ctx):
