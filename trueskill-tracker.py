@@ -377,6 +377,29 @@ class TeamBalancer:
         return []
     
     @staticmethod
+    def calculate_optimal_teams(total_players: int) -> int:
+        """
+        Calculate optimal number of teams to maximize team size toward 4 players.
+        Priority: 4 > 3 > 2 players per team
+        
+        Args:
+            total_players: Total number of players to distribute
+            
+        Returns:
+            Optimal number of teams
+        """
+        if total_players <= 3:
+            return 1
+        elif total_players <= 8:
+            return 2  # 2-4 players per team (6 players = 2 teams of 3)
+        elif total_players <= 12:
+            return 3  # 3-4 players per team
+        elif total_players <= 16:
+            return 4  # 4 players per team
+        else:
+            return 5  # 4+ players per team (max 5 teams)
+    
+    @staticmethod
     def balance_teams(players: List[Dict], num_teams: int = 2, use_randomization: bool = False) -> List[List[Dict]]:
         """Balance players into teams using optimized algorithm for minimal variance.
         
@@ -394,19 +417,8 @@ class TeamBalancer:
         total_players = len(players)
         
         # Calculate optimal number of teams based on player count
-        # Aim for 2-4 players per team, prefer more balanced distribution
-        if total_players <= 4:
-            optimal_teams = 2 if total_players >= 4 else 1
-        elif total_players <= 6:
-            optimal_teams = 3  # 2 players per team
-        elif total_players <= 8:
-            optimal_teams = 2  # 4 players per team
-        elif total_players <= 12:
-            optimal_teams = 3  # 3-4 players per team
-        elif total_players <= 16:
-            optimal_teams = 4  # 4 players per team
-        else:
-            optimal_teams = 5  # Up to 4+ players per team
+        # Priority: Maximize team size toward 4 players per team (4 > 3 > 2)
+        optimal_teams = TeamBalancer.calculate_optimal_teams(total_players)
         
         # Cap number of teams at 5
         final_teams = min(5, optimal_teams)
@@ -422,7 +434,7 @@ class TeamBalancer:
         if final_teams < 1:
             return []
         
-        # Use pure random or optimization algorithm based on randomization setting
+        # Generate teams using selected algorithm
         if use_randomization:
             return TeamBalancer.generate_random_teams(players, final_teams)
         else:
@@ -764,14 +776,164 @@ class EndGameView(PersistentView):
         except Exception as e:
             await interaction.response.send_message(f"❌ Error ending game: {str(e)}", ephemeral=True)
 
-class MatchupView(PersistentView):
+class TeamSelector(discord.ui.Select):
+    def __init__(self, teams: List[List[Dict]], result_type: str, placeholder: str):
+        self.teams = teams
+        self.result_type = result_type
+        
+        options = []
+        for i, team in enumerate(teams, 1):
+            team_names = ", ".join([p['username'] for p in team[:3]])  # Show first 3 names
+            if len(team) > 3:
+                team_names += f" (+{len(team) - 3} more)"
+            
+            options.append(discord.SelectOption(
+                label=f"Team {i}",
+                description=team_names,
+                value=str(i - 1),  # Store team index
+                emoji="🏆" if result_type == "win" else "💔" if result_type == "loss" else "🤝"
+            ))
+        
+        super().__init__(
+            placeholder=placeholder,
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id=f"team_selector_{result_type}"
+        )
+    
+    async def callback(self, interaction: discord.Interaction):
+        # This will be handled by the parent view
+        pass
+
+class MatchupResultView(PersistentView):
+    def __init__(self, bot, teams: List[List[Dict]], guild_id: int):
+        super().__init__()
+        self.bot = bot
+        self.teams = teams
+        self.guild_id = guild_id
+        self.selected_results = {}  # Store selected results
+        
+        # Add team selectors for different result types
+        self.win_selector = TeamSelector(teams, "win", "🏆 Select winning team(s)")
+        self.loss_selector = TeamSelector(teams, "loss", "💔 Select losing team(s)")
+        self.draw_selector = TeamSelector(teams, "draw", "🤝 Select team(s) for draw")
+        
+        self.add_item(self.win_selector)
+        self.add_item(self.loss_selector)
+        self.add_item(self.draw_selector)
+    
+    @discord.ui.button(label="Record Results", style=discord.ButtonStyle.primary, emoji="✅", row=1)
+    async def record_results(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Process and record the selected results."""
+        try:
+            # Check if any selections were made
+            if not any([self.win_selector.values, self.loss_selector.values, self.draw_selector.values]):
+                await interaction.response.send_message(
+                    "❌ Please select at least one team result before recording.", 
+                    ephemeral=True
+                )
+                return
+            
+            results_processed = []
+            
+            # Process win selections
+            if self.win_selector.values:
+                for team_idx_str in self.win_selector.values:
+                    team_idx = int(team_idx_str)
+                    result = await self._process_team_result(team_idx, 'win')
+                    results_processed.append(result)
+            
+            # Process loss selections
+            if self.loss_selector.values:
+                for team_idx_str in self.loss_selector.values:
+                    team_idx = int(team_idx_str)
+                    result = await self._process_team_result(team_idx, 'loss')
+                    results_processed.append(result)
+            
+            # Process draw selections
+            if self.draw_selector.values:
+                for team_idx_str in self.draw_selector.values:
+                    team_idx = int(team_idx_str)
+                    result = await self._process_team_result(team_idx, 'draw')
+                    results_processed.append(result)
+            
+            # Create summary embed
+            embed = discord.Embed(
+                title="✅ Match Results Recorded",
+                description=f"Successfully processed {len(results_processed)} team result(s)",
+                color=discord.Color.green()
+            )
+            
+            # Add results summary
+            for result in results_processed:
+                embed.add_field(
+                    name=f"{result['emoji']} Team {result['team_number']} {result['result'].title()}",
+                    value=f"{len(result['players'])} players updated",
+                    inline=True
+                )
+            
+            await interaction.response.send_message(embed=embed, ephemeral=False)
+            
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Error recording results: {str(e)}", ephemeral=True)
+    
+    @discord.ui.button(label="Reset Selections", style=discord.ButtonStyle.secondary, emoji="🔄", row=1)
+    async def reset_selections(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Reset all selections."""
+        # Clear all selector values
+        self.win_selector.values = []
+        self.loss_selector.values = []
+        self.draw_selector.values = []
+        
+        await interaction.response.send_message("🔄 Selections reset. Make new selections above.", ephemeral=True)
+    
+    async def _process_team_result(self, team_index: int, result: str) -> Dict:
+        """Process result for a specific team."""
+        team = self.teams[team_index]
+        team_number = team_index + 1
+        results_recorded = []
+        
+        # Record result for all team members
+        for player_data in team:
+            old_rating = trueskill.Rating(mu=player_data['mu'], sigma=player_data['sigma'])
+            
+            if result == 'win':
+                # Simulate a win against an average opponent
+                new_rating = trueskill.rate([[old_rating], [trueskill.Rating()]])[0][0]
+            elif result == 'loss':
+                # Simulate a loss against an average opponent
+                new_rating = trueskill.rate([[old_rating], [trueskill.Rating()]])[1][0]
+            else:  # draw
+                # Simulate a draw against an equal opponent
+                rating_groups = [[old_rating], [trueskill.Rating(mu=player_data['mu'], sigma=player_data['sigma'])]]
+                new_rating_groups = trueskill.rate(rating_groups, ranks=[0, 0])  # Both get rank 0 (tie)
+                new_rating = new_rating_groups[0][0]
+            
+            # Update player stats
+            self.bot.db.update_player_stats(player_data['user_id'], new_rating, result)
+            results_recorded.append({
+                'name': player_data['username'],
+                'old_rating': old_rating,
+                'new_rating': new_rating
+            })
+        
+        return {
+            'team_number': team_number,
+            'result': result,
+            'players': results_recorded,
+            'emoji': '🏆' if result == 'win' else '💔' if result == 'loss' else '🤝'
+        }
+
+# Legacy MatchupView (keeping for backward compatibility)
+class LegacyMatchupView(PersistentView):
     def __init__(self, bot, teams: List[List[Dict]], guild_id: int):
         super().__init__()
         self.bot = bot
         self.teams = teams
         self.guild_id = guild_id
         
-        # Create buttons for each team
+        # Create buttons for each team (old implementation)
         for i, team in enumerate(teams, 1):
             # Win button
             win_button = discord.ui.Button(
@@ -923,9 +1085,14 @@ async def trueskill_command(ctx):
               "`!ts teamwin <team_number>` - Award team members a win\n"
               "`!ts teamloss <team_number>` - Award team members a loss\n"
               "`!ts teamdraw <team_number>` - Award team members a draw\n"
-              "`!ts matchup` - Interactive matchup interface with win/loss/draw buttons\n"
+              "`!ts matchup [enhanced|legacy]` - Interactive UI for recording match results\n"
               "`!ts draw <team1_players...> vs <team2_players...>` - Record draw\n",
               #"`!ts 1v1 <@winner> <@loser>` - Record 1v1 match"
+        inline=False
+    )
+    embed.add_field(
+        name="Testing",
+        value="`!ts testbalance [player_count]` - Test team balance algorithm",
         inline=False
     )
     
@@ -1172,6 +1339,11 @@ async def create_teams(ctx, *, args: str = None):
             await ctx.send(embed=embed)
             return
         
+        # Calculate team size distribution for display
+        team_sizes = [len(team) for team in teams]
+        min_size, max_size = min(team_sizes), max(team_sizes)
+        size_distribution = f"{min_size}-{max_size} players per team" if min_size != max_size else f"{min_size} players per team"
+        
         # Create embed showing team composition
         if use_randomization:
             if region:
@@ -1180,7 +1352,7 @@ async def create_teams(ctx, *, args: str = None):
                     description=f"Created {len(teams)} completely random teams from {len(players)} players:\n"
                                f"🌍 Each team has at least one '{region}' player\n"
                                f"🎯 Teams are randomized (ignoring TrueSkill ratings)\n"
-                               f"📊 Max 4 players per team | Max 5 teams total",
+                               f"📊 {size_distribution} | Max 5 teams total",
                     color=discord.Color.purple()
                 )
             else:
@@ -1188,7 +1360,7 @@ async def create_teams(ctx, *, args: str = None):
                     title="🎲 Completely Random Teams",
                     description=f"Created {len(teams)} completely random teams from {len(players)} players:\n"
                                f"🎯 Teams are randomized (ignoring TrueSkill ratings)\n"
-                               f"📊 Max 4 players per team | Max 5 teams total",
+                               f"📊 {size_distribution} | Max 5 teams total",
                     color=discord.Color.purple()
                 )
         elif region:
@@ -1196,14 +1368,14 @@ async def create_teams(ctx, *, args: str = None):
                 title="⚖️ Region-Based Balanced Teams",
                 description=f"Created {len(teams)} balanced teams from {len(players)} players:\n"
                            f"🌍 Each team has at least one '{region}' player\n"
-                           f"📊 Max 4 players per team | Max 5 teams total",
+                           f"📊 {size_distribution} | Max 5 teams total",
                 color=discord.Color.green()
             )
         else:
             embed = discord.Embed(
                 title="⚖️ Optimally Balanced Teams",
                 description=f"Created {len(teams)} optimally balanced teams from {len(players)} players:\n"
-                           f"📊 Max 4 players per team | Max 5 teams total",
+                           f"📊 {size_distribution} | Prioritizes larger teams (target: 4 players)",
                 color=discord.Color.green()
             )
         
@@ -1655,8 +1827,12 @@ async def team_command_error(ctx, error):
         await ctx.send("❌ Missing team number. Usage: `!ts teamwin <team_number>`, `!ts teamloss <team_number>`, or `!ts teamdraw <team_number>`")
 
 @trueskill_command.command(name='matchup')
-async def matchup_interface(ctx):
-    """Interactive matchup interface showing all teams with win/loss/draw buttons."""
+async def matchup_interface(ctx, interface_type: str = "enhanced"):
+    """Interactive matchup interface for recording match results.
+    
+    Args:
+        interface_type: 'enhanced' (default) for new UI, 'legacy' for old button interface
+    """
     try:
         # Check if there are current teams
         if ctx.guild.id not in bot.current_teams or not bot.current_teams[ctx.guild.id]:
@@ -1671,11 +1847,18 @@ async def matchup_interface(ctx):
         teams = bot.current_teams[ctx.guild.id]
         
         # Create embed showing team composition
-        embed = discord.Embed(
-            title="🎮 Matchup Results Interface",
-            description=f"Click the buttons below to record results for each team.\nActive teams: {len(teams)}",
-            color=discord.Color.blue()
-        )
+        if interface_type.lower() == "legacy":
+            embed = discord.Embed(
+                title="🎮 Legacy Matchup Interface",
+                description=f"Click the buttons below to record results for each team.\nActive teams: {len(teams)}",
+                color=discord.Color.blue()
+            )
+        else:
+            embed = discord.Embed(
+                title="🎮 Enhanced Matchup Interface",
+                description=f"Use the dropdown menus to select team results, then click 'Record Results'.\nActive teams: {len(teams)}",
+                color=discord.Color.blue()
+            )
         
         # Show team composition
         for i, team in enumerate(teams, 1):
@@ -1692,8 +1875,11 @@ async def matchup_interface(ctx):
                 inline=True
             )
         
-        # Create the matchup view with buttons
-        view = MatchupView(bot, teams, ctx.guild.id)
+        # Create the appropriate matchup view
+        if interface_type.lower() == "legacy":
+            view = LegacyMatchupView(bot, teams, ctx.guild.id)
+        else:
+            view = MatchupResultView(bot, teams, ctx.guild.id)
         
         await ctx.send(embed=embed, view=view)
         
@@ -1703,6 +1889,45 @@ async def matchup_interface(ctx):
 @matchup_interface.error
 async def matchup_command_error(ctx, error):
     await ctx.send(f"❌ Error with matchup interface: {str(error)}")
+
+@trueskill_command.command(name='testbalance')
+async def test_balance(ctx, player_count: int = None):
+    """Test the team balance algorithm with different player counts."""
+    try:
+        test_counts = [4, 6, 8, 10, 12, 16, 20] if player_count is None else [player_count]
+        
+        embed = discord.Embed(
+            title="🧪 Team Balance Algorithm Test",
+            description="Testing optimal team calculations for different player counts:",
+            color=discord.Color.blue()
+        )
+        
+        for count in test_counts:
+            optimal_teams = TeamBalancer.calculate_optimal_teams(count)
+            players_per_team = count // optimal_teams
+            remainder = count % optimal_teams
+            
+            if remainder == 0:
+                distribution = f"{players_per_team} players per team"
+            else:
+                distribution = f"{players_per_team}-{players_per_team + 1} players per team"
+            
+            embed.add_field(
+                name=f"{count} Players",
+                value=f"{optimal_teams} teams\n{distribution}",
+                inline=True
+            )
+        
+        embed.add_field(
+            name="🎯 Priority",
+            value="Maximize team size toward 4 players\n(4 > 3 > 2 players per team)",
+            inline=False
+        )
+        
+        await ctx.send(embed=embed)
+        
+    except Exception as e:
+        await ctx.send(f"❌ Error testing balance: {str(e)}")
 
 @cleanup_teams.error
 async def cleanup_command_error(ctx, error):
