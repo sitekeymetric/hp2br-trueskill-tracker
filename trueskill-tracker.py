@@ -776,6 +776,344 @@ class EndGameView(PersistentView):
         except Exception as e:
             await interaction.response.send_message(f"❌ Error ending game: {str(e)}", ephemeral=True)
 
+class MatchResult:
+    """Represents a complete match result with multiple teams and their rankings."""
+    def __init__(self, teams: List[List[Dict]], ranks: List[int]):
+        self.teams = teams
+        self.ranks = ranks  # 0 = winner, 1 = second place, etc. Same rank = tie
+        self.match_id = str(uuid.uuid4())
+    
+    def validate(self) -> bool:
+        """Validate that the match result is properly formed."""
+        return (len(self.teams) == len(self.ranks) and 
+                len(self.teams) >= 2 and 
+                all(len(team) > 0 for team in self.teams))
+
+class TeamMatchProcessor:
+    """Handles proper team vs team TrueSkill calculations."""
+    
+    @staticmethod
+    def process_team_match(bot, match_result: MatchResult) -> Dict:
+        """Process a complete team match with proper TrueSkill calculations.
+        
+        Args:
+            bot: Bot instance with database access
+            match_result: MatchResult containing teams and their rankings
+            
+        Returns:
+            Dictionary with processing results and rating changes
+        """
+        if not match_result.validate():
+            raise ValueError("Invalid match result")
+        
+        # Prepare rating groups for TrueSkill calculation
+        rating_groups = []
+        team_player_data = []
+        
+        for team in match_result.teams:
+            team_ratings = []
+            team_data = []
+            for player_dict in team:
+                player = bot.db.get_player(player_dict['user_id'])
+                if not player:
+                    # Auto-register player if not exists
+                    bot.db.insert_or_update_player(player_dict['user_id'], player_dict['username'])
+                    player = bot.db.get_player(player_dict['user_id'])
+                
+                rating = trueskill.Rating(mu=player['mu'], sigma=player['sigma'])
+                team_ratings.append(rating)
+                team_data.append(player)
+            
+            rating_groups.append(team_ratings)
+            team_player_data.append(team_data)
+        
+        # Calculate new ratings using proper team vs team TrueSkill
+        new_rating_groups = trueskill.rate(rating_groups, ranks=match_result.ranks)
+        
+        # Process results and update database
+        results = {
+            'match_id': match_result.match_id,
+            'teams': [],
+            'total_players_updated': 0
+        }
+        
+        for team_idx, (team_data, old_ratings, new_ratings, rank) in enumerate(zip(
+            team_player_data, rating_groups, new_rating_groups, match_result.ranks
+        )):
+            team_result = {
+                'team_number': team_idx + 1,
+                'rank': rank,
+                'result_type': TeamMatchProcessor._rank_to_result_type(rank, match_result.ranks),
+                'players': []
+            }
+            
+            # Update each player in the team
+            for player, old_rating, new_rating in zip(team_data, old_ratings, new_ratings):
+                result_type = team_result['result_type']
+                
+                # Update player stats in database
+                bot.db.update_player_stats(player['user_id'], new_rating, result_type)
+                
+                team_result['players'].append({
+                    'name': player['username'],
+                    'user_id': player['user_id'],
+                    'old_rating': old_rating,
+                    'new_rating': new_rating,
+                    'rating_change': new_rating.mu - old_rating.mu
+                })
+                
+                results['total_players_updated'] += 1
+            
+            results['teams'].append(team_result)
+        
+        return results
+    
+    @staticmethod
+    def _rank_to_result_type(rank: int, all_ranks: List[int]) -> str:
+        """Convert rank to result type (win/loss/draw)."""
+        min_rank = min(all_ranks)
+        max_rank = max(all_ranks)
+        
+        if rank == min_rank and all_ranks.count(min_rank) == 1:
+            return 'win'  # Clear winner
+        elif rank == max_rank and all_ranks.count(max_rank) == 1:
+            return 'loss'  # Clear loser
+        else:
+            return 'draw'  # Tie or middle position
+
+class TeamVsTeamSelector(discord.ui.Select):
+    """Enhanced team selector for team vs team matchups."""
+    def __init__(self, teams: List[List[Dict]], selector_type: str):
+        self.teams = teams
+        self.selector_type = selector_type
+        
+        options = []
+        for i, team in enumerate(teams, 1):
+            team_names = ", ".join([p['username'] for p in team[:3]])
+            if len(team) > 3:
+                team_names += f" (+{len(team) - 3} more)"
+            
+            options.append(discord.SelectOption(
+                label=f"Team {i}",
+                description=team_names,
+                value=str(i - 1),
+                emoji="🏆" if selector_type == "winner" else "🥈" if selector_type == "second" else "🥉" if selector_type == "third" else "💔" if selector_type == "loser" else "🤝"
+            ))
+        
+        placeholder_map = {
+            "winner": "🏆 Select winning team (only 1)",
+            "second": "🥈 Select 2nd place team(s)", 
+            "third": "🥉 Select 3rd place team(s)",
+            "loser": "💔 Select losing team (only 1)",
+            "draw": f"🤝 Select teams that drew (up to {len(teams) - 2} teams)"
+        }
+        
+        # Set max values based on selector type and team count
+        if selector_type == "winner" or selector_type == "loser":
+            max_values = 1  # Only one winner, only one loser
+        elif selector_type == "draw":
+            max_values = max(1, len(teams) - 2)  # All teams except winner and loser can draw
+        else:
+            max_values = len(teams)  # Other positions can have multiple teams
+        
+        super().__init__(
+            placeholder=placeholder_map.get(selector_type, "Select teams"),
+            min_values=0,
+            max_values=max_values,
+            options=options,
+            custom_id=f"team_vs_team_{selector_type}"
+        )
+    
+    async def callback(self, interaction: discord.Interaction):
+        # Handled by parent view
+        await interaction.response.defer()
+
+class TeamVsTeamMatchupView(PersistentView):
+    """Enhanced matchup view with proper team vs team TrueSkill calculations."""
+    def __init__(self, bot, teams: List[List[Dict]], guild_id: int):
+        super().__init__()
+        self.bot = bot
+        self.teams = teams
+        self.guild_id = guild_id
+        
+        # Create selectors based on number of teams
+        if len(teams) == 2:
+            # Simple 2-team matchup: winner or draw
+            self.winner_selector = TeamVsTeamSelector(teams, "winner")
+            self.draw_selector = TeamVsTeamSelector(teams, "draw")
+            self.add_item(self.winner_selector)
+            self.add_item(self.draw_selector)
+        elif len(teams) == 3:
+            # 3-team matchup: winner, second, third (or draws)
+            self.winner_selector = TeamVsTeamSelector(teams, "winner")
+            self.second_selector = TeamVsTeamSelector(teams, "second")
+            self.third_selector = TeamVsTeamSelector(teams, "third")
+            self.draw_selector = TeamVsTeamSelector(teams, "draw")
+            self.add_item(self.winner_selector)
+            self.add_item(self.second_selector) 
+            self.add_item(self.third_selector)
+            self.add_item(self.draw_selector)
+        else:
+            # 4+ teams: winner, loser, and multiple teams can draw
+            self.winner_selector = TeamVsTeamSelector(teams, "winner")
+            self.loser_selector = TeamVsTeamSelector(teams, "loser")
+            self.draw_selector = TeamVsTeamSelector(teams, "draw")
+            self.add_item(self.winner_selector)
+            self.add_item(self.loser_selector)
+            self.add_item(self.draw_selector)
+    
+    @discord.ui.button(label="Process Match", style=discord.ButtonStyle.primary, emoji="⚡", row=4)
+    async def process_match(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Process the team vs team match with proper TrueSkill calculations."""
+        try:
+            # Build ranks based on selections
+            ranks = self._build_ranks_from_selections()
+            
+            if not ranks:
+                await interaction.response.send_message(
+                    "❌ Please select team placements before processing the match.",
+                    ephemeral=True
+                )
+                return
+            
+            # Create match result
+            match_result = MatchResult(self.teams, ranks)
+            
+            # Process with proper team vs team TrueSkill
+            results = TeamMatchProcessor.process_team_match(self.bot, match_result)
+            
+            # Create results embed
+            embed = discord.Embed(
+                title="⚡ Team vs Team Match Processed",
+                description=f"Match ID: `{results['match_id'][:8]}...`\n"
+                           f"Updated {results['total_players_updated']} players with proper team TrueSkill calculations",
+                color=discord.Color.green()
+            )
+            
+            # Add team results
+            for team_result in results['teams']:
+                rank_emoji = "🏆" if team_result['rank'] == 0 else "🥈" if team_result['rank'] == 1 else "🥉" if team_result['rank'] == 2 else "📍"
+                result_text = f"{rank_emoji} **{team_result['result_type'].title()}** (Rank {team_result['rank'] + 1})\n"
+                
+                for player in team_result['players']:
+                    change_sign = "+" if player['rating_change'] >= 0 else ""
+                    result_text += f"• {player['name']}: {player['old_rating'].mu:.1f} → {player['new_rating'].mu:.1f} ({change_sign}{player['rating_change']:.1f})\n"
+                
+                embed.add_field(
+                    name=f"Team {team_result['team_number']}",
+                    value=result_text,
+                    inline=True
+                )
+            
+            embed.add_field(
+                name="🎯 TrueSkill Calculation",
+                value="✅ Proper multi-team TrueSkill algorithm used\n"
+                     "📊 Ratings calculated based on team performance\n"
+                     "⚖️ Account for all teams in the match",
+                inline=False
+            )
+            
+            await interaction.response.send_message(embed=embed, ephemeral=False)
+            
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Error processing match: {str(e)}", ephemeral=True)
+    
+    @discord.ui.button(label="Reset Selections", style=discord.ButtonStyle.secondary, emoji="🔄", row=4)
+    async def reset_selections(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Reset all team selections."""
+        # Clear all selector values
+        for item in self.children:
+            if isinstance(item, TeamVsTeamSelector):
+                item.values = []
+        
+        await interaction.response.send_message("🔄 All selections reset. Make new team placement selections.", ephemeral=True)
+    
+    def _build_ranks_from_selections(self) -> List[int]:
+        """Build rank list from UI selections."""
+        num_teams = len(self.teams)
+        ranks = [999] * num_teams  # Initialize with high values
+        
+        # Get all selections
+        winners = [int(idx) for idx in self.winner_selector.values] if self.winner_selector.values else []
+        draws = [int(idx) for idx in self.draw_selector.values] if hasattr(self, 'draw_selector') and self.draw_selector.values else []
+        
+        if num_teams == 2:
+            # 2-team case: winner vs loser OR both draw
+            if len(draws) == 2:
+                # Both teams draw
+                ranks = [0, 0]  # Same rank = tie
+            elif len(winners) == 1:
+                # One winner, one loser
+                winner_idx = winners[0]
+                ranks[winner_idx] = 0  # Winner gets rank 0
+                for i in range(num_teams):
+                    if i != winner_idx:
+                        ranks[i] = 1  # Loser gets rank 1
+            else:
+                return []  # Invalid selection
+        
+        elif num_teams == 3:
+            # 3-team case: explicit ranking or draws
+            if draws:
+                # Handle draw scenarios
+                if len(draws) == 3:
+                    # All teams draw
+                    ranks = [0, 0, 0]
+                elif len(draws) == 2 and len(winners) == 1:
+                    # One winner, two teams draw for 2nd
+                    winner_idx = winners[0]
+                    ranks[winner_idx] = 0
+                    for draw_idx in draws:
+                        ranks[draw_idx] = 1  # Tied for 2nd place
+                    # Remaining team gets last place
+                    for i in range(num_teams):
+                        if i != winner_idx and i not in draws:
+                            ranks[i] = 2
+                else:
+                    return []  # Invalid draw combination
+            else:
+                # Standard 1st, 2nd, 3rd ranking
+                seconds = [int(idx) for idx in self.second_selector.values] if hasattr(self, 'second_selector') and self.second_selector.values else []
+                thirds = [int(idx) for idx in self.third_selector.values] if hasattr(self, 'third_selector') and self.third_selector.values else []
+                
+                if len(winners) == 1 and len(seconds) >= 1 and len(thirds) >= 1:
+                    # Assign ranks
+                    ranks[winners[0]] = 0
+                    for second_idx in seconds:
+                        ranks[second_idx] = 1
+                    for third_idx in thirds:
+                        ranks[third_idx] = 2
+                else:
+                    return []  # Incomplete selections
+        
+        else:
+            # 4+ teams: winner, loser, draws, and middle positions
+            losers = [int(idx) for idx in self.loser_selector.values] if hasattr(self, 'loser_selector') and self.loser_selector.values else []
+            
+            if not winners:
+                return []  # Need at least a winner
+            
+            # Assign ranks
+            for idx in winners:
+                ranks[idx] = 0  # Winners get rank 0
+            
+            for idx in draws:
+                ranks[idx] = 1  # Drawing teams get rank 1
+            
+            for idx in losers:
+                ranks[idx] = 2  # Losers get rank 2
+            
+            # Remaining teams get middle rank
+            for i in range(num_teams):
+                if ranks[i] == 999:  # Unassigned
+                    ranks[i] = 1  # Middle rank
+        
+        # Validate that all teams have been assigned
+        if 999 in ranks:
+            return []  # Some teams not assigned
+        
+        return ranks
+
 class TeamSelector(discord.ui.Select):
     def __init__(self, teams: List[List[Dict]], result_type: str, placeholder: str):
         self.teams = teams
@@ -794,10 +1132,18 @@ class TeamSelector(discord.ui.Select):
                 emoji="🏆" if result_type == "win" else "💔" if result_type == "loss" else "🤝"
             ))
         
+        # Set max values based on result type and team count
+        if result_type == "win":
+            max_values = 1  # Only one team can win in enhanced mode
+        elif result_type == "loss":
+            max_values = 1  # Only one team can lose in enhanced mode  
+        else:  # draw
+            max_values = max(1, len(teams) - 2)  # Multiple teams can draw (all except winner and loser)
+        
         super().__init__(
             placeholder=placeholder,
-            min_values=1,
-            max_values=1,
+            min_values=0,
+            max_values=max_values,
             options=options,
             custom_id=f"team_selector_{result_type}"
         )
@@ -815,9 +1161,9 @@ class MatchupResultView(PersistentView):
         self.selected_results = {}  # Store selected results
         
         # Add team selectors for different result types
-        self.win_selector = TeamSelector(teams, "win", "🏆 Select winning team(s)")
-        self.loss_selector = TeamSelector(teams, "loss", "💔 Select losing team(s)")
-        self.draw_selector = TeamSelector(teams, "draw", "🤝 Select team(s) for draw")
+        self.win_selector = TeamSelector(teams, "win", "🏆 Select winning team (only 1)")
+        self.loss_selector = TeamSelector(teams, "loss", "💔 Select losing team (only 1)")
+        self.draw_selector = TeamSelector(teams, "draw", f"🤝 Select teams for draw (up to {max(1, len(teams) - 2)})")
         
         self.add_item(self.win_selector)
         self.add_item(self.loss_selector)
@@ -1085,14 +1431,18 @@ async def trueskill_command(ctx):
               "`!ts teamwin <team_number>` - Award team members a win\n"
               "`!ts teamloss <team_number>` - Award team members a loss\n"
               "`!ts teamdraw <team_number>` - Award team members a draw\n"
-              "`!ts matchup [enhanced|legacy]` - Interactive UI for recording match results\n"
+              "`!ts matchup [enhanced|teamvsteam|legacy]` - Interactive UI for match results\n"
+              "  • enhanced: Single win/loss, multiple draw support\n"
+              "  • teamvsteam: Proper multi-team TrueSkill with complex rankings\n"
+              "  • legacy: Original button interface (backup)\n"
               "`!ts draw <team1_players...> vs <team2_players...>` - Record draw\n",
               #"`!ts 1v1 <@winner> <@loser>` - Record 1v1 match"
         inline=False
     )
     embed.add_field(
         name="Testing",
-        value="`!ts testbalance [player_count]` - Test team balance algorithm",
+        value="`!ts testbalance [player_count]` - Test team balance algorithm\n"
+              "`!ts testmatch [scenario]` - Test team vs team TrueSkill calculations",
         inline=False
     )
     
@@ -1831,7 +2181,7 @@ async def matchup_interface(ctx, interface_type: str = "enhanced"):
     """Interactive matchup interface for recording match results.
     
     Args:
-        interface_type: 'enhanced' (default) for new UI, 'legacy' for old button interface
+        interface_type: 'enhanced' (default), 'teamvsteam', or 'legacy'
     """
     try:
         # Check if there are current teams
@@ -1852,6 +2202,12 @@ async def matchup_interface(ctx, interface_type: str = "enhanced"):
                 title="🎮 Legacy Matchup Interface",
                 description=f"Click the buttons below to record results for each team.\nActive teams: {len(teams)}",
                 color=discord.Color.blue()
+            )
+        elif interface_type.lower() == "teamvsteam":
+            embed = discord.Embed(
+                title="⚡ Team vs Team Matchup Interface",
+                description=f"Select team placements for proper multi-team TrueSkill calculations.\nActive teams: {len(teams)}\n\n**⚡ Uses proper team vs team TrueSkill algorithm**",
+                color=discord.Color.gold()
             )
         else:
             embed = discord.Embed(
@@ -1875,9 +2231,32 @@ async def matchup_interface(ctx, interface_type: str = "enhanced"):
                 inline=True
             )
         
+        # Add algorithm explanation for team vs team
+        if interface_type.lower() == "teamvsteam":
+            embed.add_field(
+                name="🧠 TrueSkill Algorithm",
+                value="⚡ **Proper multi-team calculations**\n"
+                     "📊 Accounts for all teams simultaneously\n"
+                     "🎯 More accurate than individual updates\n"
+                     "⚖️ Handles complex rankings and ties\n"
+                     "🤝 Multiple teams can draw (up to total-2)",
+                inline=False
+            )
+        elif interface_type.lower() == "enhanced":
+            embed.add_field(
+                name="📊 Enhanced Features", 
+                value="🏆 **Single winner/loser selection**\n"
+                     "🤝 **Multiple teams can draw**\n"
+                     "🔄 Individual team rating updates\n"
+                     "⚡ Quick result processing",
+                inline=False
+            )
+        
         # Create the appropriate matchup view
         if interface_type.lower() == "legacy":
             view = LegacyMatchupView(bot, teams, ctx.guild.id)
+        elif interface_type.lower() == "teamvsteam":
+            view = TeamVsTeamMatchupView(bot, teams, ctx.guild.id)
         else:
             view = MatchupResultView(bot, teams, ctx.guild.id)
         
